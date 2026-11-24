@@ -9,6 +9,7 @@ static NSString * const kKeyCarRect      = @"mgliveskin_car_rect";
 static NSString * const kKeyRegionMap    = @"mgliveskin_region_map";   // {VC类名: "x,y,w,h"} 归一化屏幕坐标
 static NSString * const kKeyBgMode       = @"mgliveskin_bg_mode";      // 0白 1黑 2灰 3透明
 static NSString * const kKeyLastAdjust   = @"mgliveskin_last_adjust";  // "w,h,时间戳" 最后一次尺寸
+static NSString * const kKeyLockMap      = @"mgliveskin_lock_map";     // {VC类名: "w,h"} 锁定尺寸（pt）
 static NSString * const kKeyManualMap    = @"mgliveskin_manual_map";   // 旧版视图类匹配，boot 清除
 static NSString * const kKeyManualClass  = @"mgliveskin_manual_class"; // 旧版单值，boot 清除
 static NSString * const kKeyBallHidden   = @"mgliveskin_ball_hidden";
@@ -711,6 +712,88 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyRegionMap];
 }
 
+#pragma mark - 锁定大小（0.1.8）
+
+// 该页面锁定的尺寸（pt）；未锁定返回 CGSizeZero
+- (CGSize)lockedSizeForVC:(NSString *)vcKey {
+    if (!vcKey.length) return CGSizeZero;
+    NSDictionary *m = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kKeyLockMap];
+    NSString *s = [m isKindOfClass:[NSDictionary class]] ? m[vcKey] : nil;
+    if (![s isKindOfClass:[NSString class]] || !s.length) return CGSizeZero;
+    NSArray *p = [s componentsSeparatedByString:@","];
+    if (p.count < 2) return CGSizeZero;
+    CGSize z = CGSizeMake([p[0] floatValue], [p[1] floatValue]);
+    if (z.width < 20 || z.height < 20) return CGSizeZero;
+    return z;
+}
+
+- (void)setLockedSize:(CGSize)z forVC:(NSString *)vcKey {
+    if (!vcKey.length) return;
+    NSMutableDictionary *m = [[[NSUserDefaults standardUserDefaults]
+                               dictionaryForKey:kKeyLockMap] mutableCopy] ?: [NSMutableDictionary new];
+    if (z.width < 20 || z.height < 20) [m removeObjectForKey:vcKey];
+    else m[vcKey] = [NSString stringWithFormat:@"%.1f,%.1f", z.width, z.height];
+    [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyLockMap];
+}
+
+// 保持中心不动，把归一化区域换成「锁定尺寸」的形状
+- (CGRect)fitRegion:(CGRect)n toSize:(CGSize)lock screen:(CGSize)R {
+    if (lock.width < 20 || lock.height < 20 || R.width < 1 || R.height < 1) return n;
+    CGFloat cx = n.origin.x + n.size.width * 0.5;
+    CGFloat cy = n.origin.y + n.size.height * 0.5;
+    CGFloat w = MIN(lock.width / R.width, 2.0);
+    CGFloat h = MIN(lock.height / R.height, 2.0);
+    return CGRectMake(cx - w * 0.5, cy - h * 0.5, w, h);
+}
+
+- (void)toggleLockSize {
+    UIWindow *main = [self appMainWindow];
+    if (!main) { [self unhideBall]; return; }
+    CGFloat W = main.bounds.size.width, H = main.bounds.size.height;
+    NSString *vcKey = [self currentVCKey];
+    CGSize lock = [self lockedSizeForVC:vcKey];
+
+    if (lock.width >= 20) {   // 已锁定 → 解锁
+        [self setLockedSize:CGSizeZero forVC:vcKey];
+        [self applyOverlays];
+        MGLog(@"[锁定] 解锁（页面 %@）", vcKey);
+        [self alertDone:[NSString stringWithFormat:
+            @"已解锁大小（页面 %@）\n现在可以继续双指缩放", vcKey]];
+        return;
+    }
+
+    // 未锁定 → 取当前框尺寸，没框则回退到「最后一次调整大小」
+    CGRect n = [self regionNormForVC:vcKey];
+    if (CGRectIsNull(n)) {
+        [self alertDone:@"当前页面还没有框选区域\n请先「① 框选车图区域」拖一个框，再锁定大小"];
+        return;
+    }
+    CGSize cur = CGSizeZero;
+    if (!CGRectIsNull(n) && W > 1 && H > 1) {
+        cur = CGSizeMake(n.size.width * W, n.size.height * H);
+    }
+    NSString *src = @"当前框";
+    if (cur.width < 20 || cur.height < 20) {
+        NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyLastAdjust];
+        NSArray *p = last.length ? [last componentsSeparatedByString:@","] : nil;
+        if (p.count >= 2) {
+            cur = CGSizeMake([p[0] floatValue], [p[1] floatValue]);
+            src = @"最后调整";
+        }
+    }
+    if (cur.width < 20 || cur.height < 20) {
+        [self alertDone:@"当前页面还没有设置过大小\n"
+         "请先「① 框选车图区域」或「自定义大小」，再锁定"];
+        return;
+    }
+    [self setLockedSize:cur forVC:vcKey];
+    [self applyOverlays];
+    MGLog(@"[锁定] 锁定 %.1f × %.1f pt（来源=%@，页面 %@）", cur.width, cur.height, src, vcKey);
+    [self alertDone:[NSString stringWithFormat:
+        @"已锁定 %.0f × %.0f pt（页面 %@）\n来源：%@\n位置仍可拖动，大小固定不变",
+        cur.width, cur.height, vcKey, src]];
+}
+
 - (void)ensureOverlayWindow {
     if (self.overlayWindow) return;
     UIWindow *main = [self appMainWindow];
@@ -800,9 +883,11 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     }
     [self applyBgStyle];
     CGSize R = main.bounds.size;
+    CGSize lock = [self lockedSizeForVC:[self currentVCKey]];
+    CGRect draw = [self fitRegion:n toSize:lock screen:R];   // 锁定优先：中心不动、尺寸固定
     self.overlayView.image = self.carImage;
-    self.overlayView.frame = CGRectMake(n.origin.x * R.width, n.origin.y * R.height,
-                                        n.size.width * R.width, n.size.height * R.height);
+    self.overlayView.frame = CGRectMake(draw.origin.x * R.width, draw.origin.y * R.height,
+                                        draw.size.width * R.width, draw.size.height * R.height);
     if (self.overlayView.superview != host) {
         [self.overlayView removeFromSuperview];
         [host addSubview:self.overlayView];
@@ -963,6 +1048,12 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                                          handler:^(UIAlertAction *a) { [ws beginAdjust]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"自定义大小（输入宽高 pt）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginCustomSize]; }]];
+    CGSize lockNow = [ws lockedSizeForVC:[ws currentVCKey]];
+    NSString *lockTitle = lockNow.width >= 20
+        ? [NSString stringWithFormat:@"解锁大小（已锁定 %.0f × %.0f pt）", lockNow.width, lockNow.height]
+        : @"锁定当前大小（不再随缩放变化）";
+    [ac addAction:[UIAlertAction actionWithTitle:lockTitle style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [ws toggleLockSize]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景：%@（点按切换）", [ws bgModeName]]
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws cycleBgStyle]; }]];
@@ -1128,8 +1219,9 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     NSString *desc = nil;
     if (!CGRectIsNull(reg)) {
         CGSize R = main.bounds.size;
-        boxFrame = CGRectMake(reg.origin.x * R.width, reg.origin.y * R.height,
-                              reg.size.width * R.width, reg.size.height * R.height);
+        CGRect draw = [self fitRegion:reg toSize:[self lockedSizeForVC:[self currentVCKey]] screen:R];
+        boxFrame = CGRectMake(draw.origin.x * R.width, draw.origin.y * R.height,
+                              draw.size.width * R.width, draw.size.height * R.height);
         desc = [NSString stringWithFormat:@"区域模式 %@\n（页面 %@）",
                 NSStringFromCGRect(reg), [self currentVCKey]];
     } else {
@@ -1190,7 +1282,14 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [box addGestureRecognizer:pinch];
     [self.overlayView.superview addSubview:box];
     self.adjustView = box;
-    [self alertDone:@"拖动移动 / 双指缩放\n完成后点悬浮球选「完成微调」"];
+    CGSize lock = [self lockedSizeForVC:[self currentVCKey]];
+    if (lock.width >= 20) {
+        [self alertDone:[NSString stringWithFormat:
+            @"大小已锁定 %.0f × %.0f pt，只能拖动位置\n要改大小请先「解锁大小」",
+            lock.width, lock.height]];
+    } else {
+        [self alertDone:@"拖动移动 / 双指缩放\n完成后点悬浮球选「完成微调」"];
+    }
 }
 
 // 自定义大小：直接输入宽/高（pt），以当前框中心对齐
@@ -1200,12 +1299,19 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     CGFloat W = main.bounds.size.width, H = main.bounds.size.height;
     NSString *vcKey = [self currentVCKey];
     CGRect n = [self regionNormForVC:vcKey];
+    CGSize lock = [self lockedSizeForVC:vcKey];
     CGFloat cw = CGRectIsNull(n) ? 300.0 : n.size.width * W;
     CGFloat ch = CGRectIsNull(n) ? 150.0 : n.size.height * H;
+    if (lock.width >= 20) { cw = lock.width; ch = lock.height; }   // 已锁定 → 填锁定值
+
+    NSString *msg = [NSString stringWithFormat:@"页面 %@\n输入宽 / 高（pt），以当前框中心对齐", vcKey];
+    if (lock.width >= 20) {
+        msg = [msg stringByAppendingString:@"\n当前已锁定，改完会同步更新锁定值"];
+    }
 
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"自定义大小"
-                         message:[NSString stringWithFormat:@"页面 %@\n输入宽 / 高（pt），以当前框中心对齐", vcKey]
+                         message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.text = [NSString stringWithFormat:@"%.0f", cw];
@@ -1233,12 +1339,18 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         CGFloat cy = base.origin.y + base.size.height * 0.5;
         CGRect nn = CGRectMake(cx - nw / (2 * W), cy - nh / (2 * H), nw / W, nh / H);
         [ws saveRegion:nn forVC:vcKey];
+        // 已锁定 → 手动输入视为新的锁定尺寸
+        if ([ws lockedSizeForVC:vcKey].width >= 20) {
+            [ws setLockedSize:CGSizeMake(nw, nh) forVC:vcKey];
+        }
         [[NSUserDefaults standardUserDefaults] setObject:
             [NSString stringWithFormat:@"%.1f,%.1f,%.0f", nw, nh, [[NSDate date] timeIntervalSince1970]]
                                                   forKey:kKeyLastAdjust];
         [ws applyOverlays];
         MGLog(@"[尺寸] 手动设为 %.1f × %.1f pt（页面 %@）", nw, nh, vcKey);
-        [ws alertDone:[NSString stringWithFormat:@"已设为 %.0f × %.0f pt", nw, nh]];
+        BOOL locked = [ws lockedSizeForVC:vcKey].width >= 20;
+        [ws alertDone:[NSString stringWithFormat:@"已设为 %.0f × %.0f pt%@",
+                       nw, nh, locked ? @"（锁定值已同步）" : @""]];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
                                          handler:^(UIAlertAction *a) { [ws unhideBall]; }]];
@@ -1282,6 +1394,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 - (void)adjustPinched:(UIPinchGestureRecognizer *)g {
     CGFloat s = g.scale;
     NSString *vcKey = [self currentVCKey];
+    // 已锁定大小：缩放无效，只允许拖动位置
+    if ([self lockedSizeForVC:vcKey].width >= 20) { g.scale = 1.0; return; }
     CGRect reg = [self regionNormForVC:vcKey];
     if (!CGRectIsNull(reg)) {
         reg.size.width = MAX(0.08, MIN(1.6, reg.size.width * s));
@@ -1300,17 +1414,22 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 }
 
 - (void)finishAdjust {
-    // 记录最后一次调整后的尺寸，供诊断/后续锁定尺寸使用
+    // 记录最后一次调整后的尺寸，供诊断 / 锁定尺寸使用
     UIWindow *main = [self appMainWindow];
     if (main) {
         CGFloat W = main.bounds.size.width, H = main.bounds.size.height;
-        CGRect reg = [self regionNormForVC:[self currentVCKey]];
-        if (!CGRectIsNull(reg) && W > 1 && H > 1) {
-            CGFloat cw = reg.size.width * W, ch = reg.size.height * H;
+        NSString *vcKey = [self currentVCKey];
+        CGSize lock = [self lockedSizeForVC:vcKey];
+        CGRect reg = [self regionNormForVC:vcKey];
+        CGSize cur = CGSizeZero;
+        if (lock.width >= 20) cur = lock;    // 锁定时以锁定值为准（框宽可能已过期）
+        else if (!CGRectIsNull(reg) && W > 1 && H > 1) cur = CGSizeMake(reg.size.width * W, reg.size.height * H);
+        if (cur.width >= 20) {
             [[NSUserDefaults standardUserDefaults] setObject:
-                [NSString stringWithFormat:@"%.1f,%.1f,%.0f", cw, ch, [[NSDate date] timeIntervalSince1970]]
+                [NSString stringWithFormat:@"%.1f,%.1f,%.0f", cur.width, cur.height, [[NSDate date] timeIntervalSince1970]]
                                                       forKey:kKeyLastAdjust];
-            MGLog(@"[尺寸] 微调结束 %.1f × %.1f pt（页面 %@）", cw, ch, [self currentVCKey]);
+            MGLog(@"[尺寸] 微调结束 %.1f × %.1f pt（页面 %@，%@）",
+                  cur.width, cur.height, vcKey, lock.width >= 20 ? @"已锁定" : @"未锁定");
         }
     }
     [self.adjustView removeFromSuperview];
@@ -1333,6 +1452,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [ud removeObjectForKey:kKeyManualClass];
     [ud removeObjectForKey:kKeyRegionMap];
     [ud removeObjectForKey:kKeyManualMap];
+    [ud removeObjectForKey:kKeyLockMap];
+    [ud removeObjectForKey:kKeyLastAdjust];
     NSString *path = [MGDir() stringByAppendingPathComponent:@"car.png"];
     [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
     self.carImage = nil;
@@ -1375,6 +1496,13 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         [out appendFormat:@"[lastAdjust] %@×%@ pt  %@\n", p[0], p[1], d ?: @"-"];
     } else {
         [out appendString:@"[lastAdjust] 无\n"];
+    }
+    CGSize lk = [self lockedSizeForVC:vcKey];
+    if (lk.width >= 20) {
+        [out appendFormat:@"[lock] vc=%@ 已锁定 %.1f × %.1f pt（屏幕 %.0f × %.0f）\n",
+         vcKey, lk.width, lk.height, W, H];
+    } else {
+        [out appendFormat:@"[lock] vc=%@ 未锁定\n", vcKey];
     }
     [out appendFormat:@"[bg] %@  图片=%@\n", [self bgModeName],
      self.carImage ? NSStringFromCGSize(self.carImage.size) : @"无"];

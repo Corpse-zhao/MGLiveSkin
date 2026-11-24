@@ -9,7 +9,7 @@ import urllib.request
 
 API = "https://api.github.com"
 REPO = "Corpse-zhao/MGLiveSkin"
-VER = "0.1.7"
+VER = "0.1.8"
 TAG = "v" + VER
 TOKEN = os.environ.get("GH_TOKEN", "")
 if not TOKEN:
