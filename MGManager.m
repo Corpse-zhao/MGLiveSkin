@@ -7,6 +7,8 @@
 // ---------------- 常量 ----------------
 static NSString * const kKeyCarRect      = @"mgliveskin_car_rect";
 static NSString * const kKeyRegionMap    = @"mgliveskin_region_map";   // {VC类名: "x,y,w,h"} 归一化屏幕坐标
+static NSString * const kKeyBgMode       = @"mgliveskin_bg_mode";      // 0白 1黑 2灰 3透明
+static NSString * const kKeyLastAdjust   = @"mgliveskin_last_adjust";  // "w,h,时间戳" 最后一次尺寸
 static NSString * const kKeyManualMap    = @"mgliveskin_manual_map";   // 旧版视图类匹配，boot 清除
 static NSString * const kKeyManualClass  = @"mgliveskin_manual_class"; // 旧版单值，boot 清除
 static NSString * const kKeyBallHidden   = @"mgliveskin_ball_hidden";
@@ -726,6 +728,40 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     MGLog(@"[覆盖窗口] 已创建 level=%.0f frame=%@", w.windowLevel, NSStringFromCGRect(f));
 }
 
+- (void)applyBgStyle {
+    NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kKeyBgMode];
+    UIColor *c = [UIColor whiteColor];
+    if (mode == 1) c = [UIColor blackColor];
+    else if (mode == 2) c = [UIColor colorWithWhite:0.93 alpha:1.0];
+    else if (mode == 3) c = [UIColor clearColor];
+    self.overlayView.backgroundColor = c;
+    // 不透明背景时用 AspectFill 铺满，避免留白让底下的 3D 原车透出来
+    BOOL transparent = (mode == 3);
+    self.overlayView.contentMode = transparent ? UIViewContentModeScaleAspectFit
+                                               : UIViewContentModeScaleAspectFill;
+    self.overlayView.clipsToBounds = !transparent;
+}
+
+- (NSString *)bgModeName {
+    NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kKeyBgMode];
+    switch (mode) {
+        case 1: return @"黑色";
+        case 2: return @"灰色";
+        case 3: return @"透明";
+        default: return @"白色";
+    }
+}
+
+- (void)cycleBgStyle {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSInteger mode = ([ud integerForKey:kKeyBgMode] + 1) % 4;
+    [ud setInteger:mode forKey:kKeyBgMode];
+    [self applyBgStyle];
+    [self applyOverlays];
+    MGLog(@"[背景] 切换为 %@", [self bgModeName]);
+    [self alertDone:[NSString stringWithFormat:@"背景已切换：%@\n透明模式可能透出原车", [self bgModeName]]];
+}
+
 // 按当前页面的区域配置挂载覆盖图；没有配置则返回 NO
 - (BOOL)mountRegionOverlayIfNeeded {
     UIWindow *main = [self appMainWindow];
@@ -758,13 +794,11 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     }
     if (!self.overlayView) {
         UIImageView *iv = [UIImageView new];
-        iv.backgroundColor = [UIColor clearColor];
         iv.userInteractionEnabled = NO;
-        iv.contentMode = UIViewContentModeScaleAspectFit;
-        iv.clipsToBounds = NO;
         iv.autoresizingMask = UIViewAutoresizingNone;
         self.overlayView = iv;
     }
+    [self applyBgStyle];
     CGSize R = main.bounds.size;
     self.overlayView.image = self.carImage;
     self.overlayView.frame = CGRectMake(n.origin.x * R.width, n.origin.y * R.height,
@@ -925,8 +959,13 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                                          handler:^(UIAlertAction *a) { [ws beginManualPick]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"② 替换车辆图片（相册选图）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws pickCarImage]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"微调位置 / 大小" style:UIAlertActionStyleDefault
+    [ac addAction:[UIAlertAction actionWithTitle:@"微调位置 / 大小（手势）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginAdjust]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"自定义大小（输入宽高 pt）" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [ws beginCustomSize]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景：%@（点按切换）", [ws bgModeName]]
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [ws cycleBgStyle]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"测试生效区域（橙色高亮）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws testHit]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复原车图" style:UIAlertActionStyleDestructive
@@ -1154,6 +1193,59 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [self alertDone:@"拖动移动 / 双指缩放\n完成后点悬浮球选「完成微调」"];
 }
 
+// 自定义大小：直接输入宽/高（pt），以当前框中心对齐
+- (void)beginCustomSize {
+    UIWindow *main = [self appMainWindow];
+    if (!main) { [self unhideBall]; return; }
+    CGFloat W = main.bounds.size.width, H = main.bounds.size.height;
+    NSString *vcKey = [self currentVCKey];
+    CGRect n = [self regionNormForVC:vcKey];
+    CGFloat cw = CGRectIsNull(n) ? 300.0 : n.size.width * W;
+    CGFloat ch = CGRectIsNull(n) ? 150.0 : n.size.height * H;
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"自定义大小"
+                         message:[NSString stringWithFormat:@"页面 %@\n输入宽 / 高（pt），以当前框中心对齐", vcKey]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = [NSString stringWithFormat:@"%.0f", cw];
+        tf.placeholder = @"宽 pt";
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = [NSString stringWithFormat:@"%.0f", ch];
+        tf.placeholder = @"高 pt";
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    __weak MGManager *ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+        CGFloat nw = [ac.textFields.firstObject.text floatValue];
+        CGFloat nh = [ac.textFields.lastObject.text floatValue];
+        if (nw < 20 || nh < 20 || nw > W || nh > H) {
+            [ws alertDone:[NSString stringWithFormat:@"尺寸不合理（20 ~ %.0f × %.0f）", W, H]];
+            return;
+        }
+        CGRect base = CGRectIsNull(n) ? CGRectMake(0.5, 0.5, 0, 0) : n;
+        CGFloat cx = base.origin.x + base.size.width * 0.5;
+        CGFloat cy = base.origin.y + base.size.height * 0.5;
+        CGRect nn = CGRectMake(cx - nw / (2 * W), cy - nh / (2 * H), nw / W, nh / H);
+        [ws saveRegion:nn forVC:vcKey];
+        [[NSUserDefaults standardUserDefaults] setObject:
+            [NSString stringWithFormat:@"%.1f,%.1f,%.0f", nw, nh, [[NSDate date] timeIntervalSince1970]]
+                                                  forKey:kKeyLastAdjust];
+        [ws applyOverlays];
+        MGLog(@"[尺寸] 手动设为 %.1f × %.1f pt（页面 %@）", nw, nh, vcKey);
+        [ws alertDone:[NSString stringWithFormat:@"已设为 %.0f × %.0f pt", nw, nh]];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                         handler:^(UIAlertAction *a) { [ws unhideBall]; }]];
+    UIViewController *top = [self topVC];
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
 - (void)adjustPanned:(UIPanGestureRecognizer *)g {
     // 区域模式：直接改区域归一化坐标
     UIWindow *win = [self appMainWindow];
@@ -1208,6 +1300,19 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 }
 
 - (void)finishAdjust {
+    // 记录最后一次调整后的尺寸，供诊断/后续锁定尺寸使用
+    UIWindow *main = [self appMainWindow];
+    if (main) {
+        CGFloat W = main.bounds.size.width, H = main.bounds.size.height;
+        CGRect reg = [self regionNormForVC:[self currentVCKey]];
+        if (!CGRectIsNull(reg) && W > 1 && H > 1) {
+            CGFloat cw = reg.size.width * W, ch = reg.size.height * H;
+            [[NSUserDefaults standardUserDefaults] setObject:
+                [NSString stringWithFormat:@"%.1f,%.1f,%.0f", cw, ch, [[NSDate date] timeIntervalSince1970]]
+                                                      forKey:kKeyLastAdjust];
+            MGLog(@"[尺寸] 微调结束 %.1f × %.1f pt（页面 %@）", cw, ch, [self currentVCKey]);
+        }
+    }
     [self.adjustView removeFromSuperview];
     self.adjustView = nil;
     self.adjusting = NO;
@@ -1248,6 +1353,31 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     UIViewController *vc = [self topVC];
     [out appendFormat:@"[topVC] %@ title=%@ navTitle=%@\n", NSStringFromClass([vc class]),
      vc.title ?: @"-", vc.navigationItem.title ?: @"-"];
+    // 区域与尺寸快照：方便定位「最后一次调整大小」
+    NSString *vcKey = [self currentVCKey];
+    UIWindow *main = [self appMainWindow];
+    CGFloat W = main ? main.bounds.size.width : 0, H = main ? main.bounds.size.height : 0;
+    CGRect reg = [self regionNormForVC:vcKey];
+    if (!CGRectIsNull(reg)) {
+        [out appendFormat:@"[region] vc=%@ norm={%.4f,%.4f,%.4f,%.4f} pt={%.1f,%.1f,%.1f,%.1f}\n",
+         vcKey, reg.origin.x, reg.origin.y, reg.size.width, reg.size.height,
+         reg.origin.x * W, reg.origin.y * H, reg.size.width * W, reg.size.height * H];
+        NSArray *rm = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:kKeyRegionMap] allKeys];
+        [out appendFormat:@"[region-all] %@\n", [rm componentsJoinedByString:@", "]];
+    } else {
+        [out appendFormat:@"[region] vc=%@ 无配置\n", vcKey];
+    }
+    NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyLastAdjust];
+    if (last.length) {
+        NSArray *p = [last componentsSeparatedByString:@","];
+        double ts = p.count >= 3 ? [p[2] doubleValue] : 0;
+        NSDate *d = ts > 0 ? [NSDate dateWithTimeIntervalSince1970:ts] : nil;
+        [out appendFormat:@"[lastAdjust] %@×%@ pt  %@\n", p[0], p[1], d ?: @"-"];
+    } else {
+        [out appendString:@"[lastAdjust] 无\n"];
+    }
+    [out appendFormat:@"[bg] %@  图片=%@\n", [self bgModeName],
+     self.carImage ? NSStringFromCGSize(self.carImage.size) : @"无"];
     NSArray<UIWindow *> *wins = [self appWindows];
     [out appendFormat:@"[windows] 共 %lu 个\n", (unsigned long)wins.count];
     for (UIWindow *win in wins) {

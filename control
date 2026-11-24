@@ -1,7 +1,7 @@
 Package: com.corpsezhao.mgliveskin
 Name: MGLiveSkin
 Depends: mobilesubstrate
-Version: 0.1.6
+Version: 0.1.7
 Architecture: iphoneos-arm64e
 Description: MG Live 车辆状态页车图换装（悬浮球选图 / 去白底 / 微调 / 一键还原）- roothide
 Author: Corpse-zhao
