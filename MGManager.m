@@ -6,7 +6,8 @@
 
 // ---------------- 常量 ----------------
 static NSString * const kKeyCarRect      = @"mgliveskin_car_rect";
-static NSString * const kKeyManualClass  = @"mgliveskin_manual_class";
+static NSString * const kKeyManualMap    = @"mgliveskin_manual_map";   // {VC类名: 视图类名}
+static NSString * const kKeyManualClass  = @"mgliveskin_manual_class"; // 旧版单值，boot 时清除
 static NSString * const kKeyBallHidden   = @"mgliveskin_ball_hidden";
 
 // ---------------- 日志 ----------------
@@ -282,8 +283,10 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MGLog(@"========== MGLiveSkin %@ boot ==========", MG_VERSION);
-        // 0.1.1 及以前的「隐藏悬浮球」是死胡同（重启也不恢复），启动时清除旧标记
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyBallHidden];
+        // 清理历史遗留：0.1.1 的隐藏标记（死胡同）与 0.1.2 前的单值手动 class（跨页误命中）
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud removeObjectForKey:kKeyBallHidden];
+        [ud removeObjectForKey:kKeyManualClass];
         [self installHiddenHook];
         // App 启动后 scene 才就绪，做多轮补装
         for (int i = 1; i <= 8; i++) {
@@ -376,13 +379,14 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     for (NSString *k in @[@"车辆状态", @"VehicleStatus", @"CarStatus", @"爱车", @"续航", @"里程"]) {
         if (title.length && [title containsString:k]) return YES;
     }
-    // VC 类名带 Car/Vehicle/Drive/Status 也算（MG Live 大量 MG* 自定义类）
+    // VC 类名带 Car/Vehicle/Drive/Status/LoveCar 也算（已知 RWMyLoveCarStatuVC_DY）
     NSString *vcn = NSStringFromClass([vc class]);
-    for (NSString *k in @[@"Car", @"Vehicle", @"Drive", @"Status"]) {
+    for (NSString *k in @[@"Car", @"Vehicle", @"Drive", @"Status", @"LoveCar"]) {
         if ([vcn containsString:k]) return YES;
     }
     return MGViewHasText(root, @[@"车辆状态", @"当前续航", @"总里程", @"胎压",
-                                 @"续航", @"里程", @"空调", @"车辆健康"], 0);
+                                 @"续航", @"里程", @"空调", @"车辆健康",
+                                 @"蓝牙控制", @"寻车", @"后备箱", @"主驾加热"], 0);
 }
 
 // 自动识别车图：按尺寸/比例/位置/页面特征打分。
@@ -397,10 +401,14 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
     if (W < 100 || H < 100) return nil;
 
-    NSString *manual = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyManualClass];
-
-    // 手动指定过 class：整个窗口树里找该 class 的最大可见图像视图，不卡页面
+    // 手动指定过 class：按「当前页面 VC 类名」取配置，整个窗口树找该 class
+    // 的最大可见图像视图（≥60% 落在屏幕内），不卡页面文字
+    UIViewController *vcNow = [self topVC];
+    NSString *vcKey = NSStringFromClass([vcNow class]);
+    NSDictionary *map = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kKeyManualMap];
+    NSString *manual = map[vcKey];
     if (manual.length) {
+        MGLog(@"[识别] 页面 %@ 使用手动配置 %@", vcKey, manual);
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
         UIView *best = nil;
         CGFloat bestArea = 0;
@@ -433,7 +441,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         MGLog(@"[识别] 手动 class %@ 在当前页面未找到，回退自动识别", manual);
     }
 
-    UIViewController *vc = [self topVC];
+    UIViewController *vc = vcNow;
     BOOL pageOK = [self onVehicleStatusPage:root vc:vc];
     if (!pageOK) return nil;   // 未手动框选且页面不匹配时仍不动手，避免乱替换
 
@@ -453,10 +461,10 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
             CGRect vis = CGRectIntersection(inRoot, root.bounds);
             if (vis.size.width * vis.size.height < b.width * b.height * 0.6) continue;
             CGFloat ratio = b.height / MAX(b.width, 1.0);   // 高/宽
-            // 放宽：横图 / 方图 / 竖图都认（俯视车图不一定是竖长图）
+            // 横图 / 方图 / 竖图都认：爱车页横车高约 130（0.1.2 被 h>=140 卡掉）
             BOOL sizeOK = (b.width >= 90 && b.width <= W * 0.85 &&
-                           b.height >= 140 && b.height <= H * 0.75 &&
-                           ratio >= 0.35 && ratio <= 6.0);
+                           b.height >= 110 && b.height <= H * 0.75 &&
+                           ratio >= 0.25 && ratio <= 6.0);
             // 排除明显的全屏背景图
             BOOL bgLike = (b.width >= W * 0.98 && b.height >= H * 0.9);
             CGFloat midX = CGRectGetMidX(inRoot);
@@ -476,7 +484,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
     }
     if (bestScore < 3.0) {
-        MGLog(@"[识别] 未找到车图（pageOK=%d 最高分 %.2f）", (int)pageOK, bestScore);
+        MGLog(@"[识别] 未找到车图（page=%@ pageOK=%d 最高分 %.2f）", vcKey, (int)pageOK, bestScore);
         return nil;
     }
     self.carView = best;
@@ -571,7 +579,22 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         MGLog(@"[图片] 重新加载 %@ stamp=%@", self.carImage ? @"OK" : @"失败", stamp);
     }
     UIView *car = [self findCarView];
-    if (!car) return;
+    if (!car) {
+        // 修复 0.1.2 误报：目标失效（换页/识别失败）时清掉残留 overlay，
+        // 否则旧 overlay 一直挂着，选图后会误弹「替换成功」
+        if (self.overlayView && (!self.carView || !self.carView.window)) {
+            MGLog(@"[覆盖] 目标失效，清理残留 overlay");
+            UIView *staleCar = self.carView;
+            [self unmountOverlay];
+            if (gGuardView == staleCar) gGuardView = nil;
+            if (self.origSaved && staleCar) {
+                staleCar.hidden = self.origHidden;
+                staleCar.alpha = self.origAlpha;
+                self.origSaved = NO;
+            }
+        }
+        return;
+    }
     if (!self.carImage) {
         if (self.overlayView || (self.origSaved && car.hidden)) [self restoreCar:car];
         return;
@@ -687,12 +710,12 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                                                                 message:nil
                                                          preferredStyle:UIAlertControllerStyleActionSheet];
     __weak MGManager *ws = self;
-    [ac addAction:[UIAlertAction actionWithTitle:@"替换车辆图片（相册）" style:UIAlertActionStyleDefault
+    [ac addAction:[UIAlertAction actionWithTitle:@"① 手动框选原车图（本页指定目标，推荐）" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [ws beginManualPick]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"② 替换车辆图片（相册选图）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws pickCarImage]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"微调位置 / 大小" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginAdjust]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"手动框选原车图（识别失败时用）" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) { [ws beginManualPick]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"测试命中位置（橙色高亮）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws testHit]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复原车图" style:UIAlertActionStyleDestructive
@@ -766,7 +789,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                     self.carView = nil;   // 重新识别
                     [self applyOverlays];
                     MGLog(@"[选图] 已写入 %@ (%lu bytes)", path, (unsigned long)png.length);
-                    if (self.overlayView && self.overlayView.superview) {
+                    if (self.carView && self.carView.window &&
+                        self.overlayView && self.overlayView.superview) {
                         UIView *car = self.carView;
                         [self alertDone:[NSString stringWithFormat:
                             @"已替换 → 命中 %@\nframe=%@\n若画面无变化，请把 Documents/MGLiveSkin/log.txt 发回",
@@ -774,7 +798,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                             NSStringFromCGRect(car.frame)]];
                     } else {
                         [self alertDone:@"图片已保存，但当前页面没识别到车图。\n"
-                         "请先进入车辆状态页，再用「手动框选原车图」点一下原图。"];
+                         "推荐用「手动框选原车图」点一下原图（每个页面分别框选一次）。"];
                     }
                 });
             });
@@ -815,12 +839,18 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         [ws unmountOverlay];
         ws.carView = found;
         ws.origSaved = NO;
-        [[NSUserDefaults standardUserDefaults] setObject:NSStringFromClass([found class])
-                                                  forKey:kKeyManualClass];
+        // 按「当前页面 VC 类名」记忆，各页面互不影响
+        NSString *vcKey = NSStringFromClass([[ws topVC] class]);
+        NSMutableDictionary *m = [[[NSUserDefaults standardUserDefaults]
+                                   dictionaryForKey:kKeyManualMap] mutableCopy] ?: [NSMutableDictionary new];
+        m[vcKey] = NSStringFromClass([found class]);
+        [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyManualMap];
         [ws applyOverlays];
-        MGLog(@"[框选] 手动选中 %@ frame=%@", NSStringFromClass([found class]),
-              NSStringFromCGRect(found.frame));
-        [ws alertDone:@"已选中该车图，如位置不对可微调"];
+        MGLog(@"[框选] 页面 %@ 手动选中 %@ frame=%@", vcKey,
+              NSStringFromClass([found class]), NSStringFromCGRect(found.frame));
+        [ws alertDone:[NSString stringWithFormat:
+            @"已选中 %@（页面 %@）\n先选图再框选也行：菜单「替换车辆图片（相册）」",
+            NSStringFromClass([found class]), vcKey]];
     };
 }
 
@@ -917,8 +947,15 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 #pragma mark - 恢复 / 诊断
 
 - (void)restoreOriginal {
-    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyCarRect];
-    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyManualClass];
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud removeObjectForKey:kKeyCarRect];
+    [ud removeObjectForKey:kKeyManualClass];
+    // 清除当前页面的手动配置（全部清除，彻底还原）
+    NSMutableDictionary *m = [[ud dictionaryForKey:kKeyManualMap] mutableCopy];
+    if (m.count) {
+        [m removeAllObjects];
+        [ud setObject:m forKey:kKeyManualMap];
+    }
     NSString *path = [MGDir() stringByAppendingPathComponent:@"car.png"];
     [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
     self.carImage = nil;

@@ -32,7 +32,7 @@ while off < len(raw):
 print("=== control ===")
 print(control_text)
 assert "iphoneos-arm64e" in control_text
-assert "Version: 0.1.2" in control_text
+assert "Version: 0.1.3" in control_text
 
 tarbytes = None
 for opener in (
@@ -79,7 +79,7 @@ def has(s):
     return s.encode("utf-8") in dylib or s.encode("utf-16-le") in dylib
 
 
-for kw in ("com.saicmotor.mgapp", "0.1.2", "MGLiveSkin"):
+for kw in ("com.saicmotor.mgapp", "0.1.3", "MGLiveSkin"):
     print("关键字", kw, has(kw))
     assert has(kw)
 print("✅ 校验通过")
