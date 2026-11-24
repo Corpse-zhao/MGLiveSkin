@@ -282,6 +282,8 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MGLog(@"========== MGLiveSkin %@ boot ==========", MG_VERSION);
+        // 0.1.1 及以前的「隐藏悬浮球」是死胡同（重启也不恢复），启动时清除旧标记
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kKeyBallHidden];
         [self installHiddenHook];
         // App 启动后 scene 才就绪，做多轮补装
         for (int i = 1; i <= 8; i++) {
@@ -410,16 +412,22 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                 [NSStringFromClass([v class]) isEqualToString:manual]) {
                 CGSize b = v.bounds.size;
                 if (b.width >= 50 && b.height >= 50) {
-                    CGFloat area = b.width * b.height;
-                    if (area > bestArea) { bestArea = area; best = v; }
+                    CGRect fr = [v convertRect:v.bounds toView:root];
+                    CGRect vis = CGRectIntersection(fr, root.bounds);
+                    // 必须至少 60% 落在屏幕内，排除滚出屏幕的 cell
+                    if (vis.size.width * vis.size.height >= b.width * b.height * 0.6) {
+                        CGFloat area = b.width * b.height;
+                        if (area > bestArea) { bestArea = area; best = v; }
+                    }
                 }
             }
             if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
         }
         if (best) {
             self.carView = best;
-            MGLog(@"[识别] 手动 class 命中 %@ frame=%@", NSStringFromClass([best class]),
-                  NSStringFromCGRect(best.frame));
+            MGLog(@"[识别] 手动 class 命中 %@ frame=%@ superview=%@",
+                  NSStringFromClass([best class]), NSStringFromCGRect(best.frame),
+                  NSStringFromClass([best.superview class]));
             return best;
         }
         MGLog(@"[识别] 手动 class %@ 在当前页面未找到，回退自动识别", manual);
@@ -441,6 +449,9 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         if (hasVisual && !v.hidden && v.alpha > 0.05) {
             CGSize b = v.bounds.size;
             CGRect inRoot = [v convertRect:v.bounds toView:root];
+            // 必须至少 60% 落在屏幕内，排除滚出屏幕的 cell（0.1.1 命中屏外图的主因）
+            CGRect vis = CGRectIntersection(inRoot, root.bounds);
+            if (vis.size.width * vis.size.height < b.width * b.height * 0.6) continue;
             CGFloat ratio = b.height / MAX(b.width, 1.0);   // 高/宽
             // 放宽：横图 / 方图 / 竖图都认（俯视车图不一定是竖长图）
             BOOL sizeOK = (b.width >= 90 && b.width <= W * 0.85 &&
@@ -682,18 +693,12 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                                          handler:^(UIAlertAction *a) { [ws beginAdjust]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"手动框选原车图（识别失败时用）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginManualPick]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"测试命中位置（橙色高亮）" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [ws testHit]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复原车图" style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *a) { [ws restoreOriginal]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"导出视图树（诊断）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws dumpViewTree]; }]];
-    BOOL hidden = [[NSUserDefaults standardUserDefaults] boolForKey:kKeyBallHidden];
-    [ac addAction:[UIAlertAction actionWithTitle:hidden ? @"显示悬浮球" : @"隐藏悬浮球（重启 App 恢复）"
-                                           style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) {
-        [[NSUserDefaults standardUserDefaults] setBool:!hidden forKey:kKeyBallHidden];
-        if (!hidden) { ws.ballWindow.hidden = YES; }
-        else { [ws ensureBall]; [ws alertDone:@"悬浮球已显示"]; }
-    }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
                                          handler:^(UIAlertAction *a) { [ws unhideBall]; }]];
     if (ac.popoverPresentationController) {
@@ -762,7 +767,11 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                     [self applyOverlays];
                     MGLog(@"[选图] 已写入 %@ (%lu bytes)", path, (unsigned long)png.length);
                     if (self.overlayView && self.overlayView.superview) {
-                        [self alertDone:@"车辆图片已替换\n如位置不对，选「微调位置 / 大小」"];
+                        UIView *car = self.carView;
+                        [self alertDone:[NSString stringWithFormat:
+                            @"已替换 → 命中 %@\nframe=%@\n若画面无变化，请把 Documents/MGLiveSkin/log.txt 发回",
+                            NSStringFromClass([car class]),
+                            NSStringFromCGRect(car.frame)]];
                     } else {
                         [self alertDone:@"图片已保存，但当前页面没识别到车图。\n"
                          "请先进入车辆状态页，再用「手动框选原车图」点一下原图。"];
@@ -821,6 +830,32 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     w.hidden = YES;
     w.rootViewController = nil;
     w.windowScene = nil;
+}
+
+// 调试：橙色高亮显示当前识别命中的位置，5 秒后自动消失
+- (void)testHit {
+    self.carView = nil;   // 强制重新识别，反映当前页面状态
+    UIView *car = [self findCarView];
+    if (!car || !car.superview) {
+        [self alertDone:@"当前页面未识别到车图\n（可先用手动框选指定，再回来验证）"];
+        return;
+    }
+    UIView *box = [[UIView alloc] initWithFrame:[car convertRect:car.bounds toView:car.superview]];
+    box.backgroundColor = [[UIColor colorWithRed:1.0 green:0.42 blue:0.0 alpha:0.45] colorWithAlphaComponent:0.45];
+    box.layer.borderColor = [UIColor whiteColor].CGColor;
+    box.layer.borderWidth = 2.0;
+    box.userInteractionEnabled = NO;
+    box.tag = 9527;
+    [car.superview addSubview:box];
+    [car.superview bringSubviewToFront:box];
+    MGLog(@"[测试] 高亮 %@ frame=%@ superview=%@", NSStringFromClass([car class]),
+          NSStringFromCGRect(car.frame), NSStringFromClass([car.superview class]));
+    __weak UIView *wbox = box;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [wbox removeFromSuperview]; });
+    [self alertDone:[NSString stringWithFormat:
+        @"橙色区域 = 当前命中 %@\nframe=%@\n不在车图上？请用手动框选重新指定",
+        NSStringFromClass([car class]), NSStringFromCGRect(car.frame)]];
 }
 
 #pragma mark - 微调

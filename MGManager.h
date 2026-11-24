@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 
-#define MG_VERSION @"0.1.1"
+#define MG_VERSION @"0.1.2"
 #define MG_TARGET_BUNDLE @"com.saicmotor.mgapp"
 
 @interface MGManager : NSObject
