@@ -1039,9 +1039,24 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     }
 }
 
+// 每个页面一张图：car_<VC类名>.png；没有则回退全局 car.png
+- (NSString *)ownImagePathForVC:(NSString *)vcKey {
+    NSString *safe = [[vcKey componentsSeparatedByCharactersInSet:
+                       [[NSCharacterSet alphanumericCharacterSet] invertedSet]]
+                      componentsJoinedByString:@""];
+    if (!safe.length) safe = @"page";
+    return [MGDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"car_%@.png", safe]];
+}
+
+- (NSString *)imagePathForVC:(NSString *)vcKey {
+    NSString *own = [self ownImagePathForVC:vcKey];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:own]) return own;
+    return [MGDir() stringByAppendingPathComponent:@"car.png"];
+}
+
 - (void)applyOverlays {
-    NSString *path = [MGDir() stringByAppendingPathComponent:@"car.png"];
-    NSString *stamp = MGFileStamp(path);
+    NSString *path = [self imagePathForVC:[self currentVCKey]];
+    NSString *stamp = [NSString stringWithFormat:@"%@|%@", path, MGFileStamp(path) ?: @"-"];
     if (![stamp isEqualToString:self.imageStamp]) {
         self.imageStamp = stamp;
         self.carImage = [[UIImage alloc] initWithContentsOfFile:path];
@@ -1137,7 +1152,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     __weak MGManager *ws = self;
     [ac addAction:[UIAlertAction actionWithTitle:@"① 框选车图区域（拖框，推荐先做）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginManualPick]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"② 替换车辆图片（相册选图）" style:UIAlertActionStyleDefault
+    [ac addAction:[UIAlertAction actionWithTitle:@"② 替换车辆图片（相册选图，只改本页）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws pickCarImage]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"微调位置 / 大小（手势）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginAdjust]; }]];
@@ -1213,6 +1228,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     PHPickerResult *res = results.firstObject;
+    NSString *pageKey = [self currentVCKey];   // 锁图到当前页面，两个页面可以各用一张
     [picker dismissViewControllerAnimated:YES completion:^{
         if (!res) { [self unhideBall]; return; }
         [self loadImageData:res done:^(NSData *data) {
@@ -1224,8 +1240,14 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
             }
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                 NSData *png = MGPrepareCarPNG(data);
-                NSString *path = [MGDir() stringByAppendingPathComponent:@"car.png"];
+                NSString *path = [self ownImagePathForVC:pageKey];
                 BOOL ok = png.length && [png writeToFile:path atomically:YES];
+                if (ok) {   // 第一张图同时作为全局兜底，避免另一页变成空白
+                    NSString *global = [MGDir() stringByAppendingPathComponent:@"car.png"];
+                    if (![[NSFileManager defaultManager] fileExistsAtPath:global]) {
+                        [png writeToFile:global atomically:YES];
+                    }
+                }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (!ok) { [self alertDone:@"图片处理失败，请换一张试试"]; return; }
                     self.imageStamp = nil;
@@ -1235,7 +1257,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                     if (self.boardView && self.boardView.superview) {
                         NSString *vcKey = [self currentVCKey];
                         if (!CGRectIsNull([self regionNormForVC:vcKey])) {
-                            [self alertDone:@"已替换（区域模式）\n位置不对可用「微调位置 / 大小」"];
+                            [self alertDone:[NSString stringWithFormat:
+                                @"已替换（页面 %@）\n原车还露出来就用「遮挡外扩」加一圈", pageKey]];
                         } else {
                             UIView *car = self.carView;
                             [self alertDone:[NSString stringWithFormat:
@@ -1573,8 +1596,12 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [ud removeObjectForKey:kKeyLastAdjust];
     [ud removeObjectForKey:kKeyPadMap];
     [ud removeObjectForKey:kKeyFillMode];
-    NSString *path = [MGDir() stringByAppendingPathComponent:@"car.png"];
-    [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+    NSString *dir = MGDir();
+    for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:NULL]) {
+        if ([f hasPrefix:@"car"] && [f hasSuffix:@".png"]) {
+            [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:f] error:NULL];
+        }
+    }
     self.carImage = nil;
     self.imageStamp = nil;
     UIView *car = self.carView;
@@ -1624,6 +1651,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         [out appendFormat:@"[lock] vc=%@ 未锁定\n", vcKey];
     }
     [out appendFormat:@"[pad] vc=%@ 遮挡外扩 %.0f pt\n", vcKey, [self padForVC:vcKey]];
+    [out appendFormat:@"[img] %@\n", [[self imagePathForVC:vcKey] lastPathComponent]];
     [out appendFormat:@"[fill] %@\n", [self fillModeName]];
     [out appendFormat:@"[bg] %@  图片=%@  板子=%@\n", [self bgModeName],
      self.carImage ? NSStringFromCGSize(self.carImage.size) : @"无",
