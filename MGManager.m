@@ -10,6 +10,8 @@ static NSString * const kKeyRegionMap    = @"mgliveskin_region_map";   // {VC类
 static NSString * const kKeyBgMode       = @"mgliveskin_bg_mode";      // 0白 1黑 2灰 3透明
 static NSString * const kKeyLastAdjust   = @"mgliveskin_last_adjust";  // "w,h,时间戳" 最后一次尺寸
 static NSString * const kKeyLockMap      = @"mgliveskin_lock_map";     // {VC类名: "w,h"} 锁定尺寸（pt）
+static NSString * const kKeyPadMap       = @"mgliveskin_pad_map";      // {VC类名: "pt"} 遮挡板四周外扩
+static NSString * const kKeyFillMode     = @"mgliveskin_fill_mode";    // 0适应(完整显示) 1填充(裁切铺满)
 static NSString * const kKeyManualMap    = @"mgliveskin_manual_map";   // 旧版视图类匹配，boot 清除
 static NSString * const kKeyManualClass  = @"mgliveskin_manual_class"; // 旧版单值，boot 清除
 static NSString * const kKeyBallHidden   = @"mgliveskin_ball_hidden";
@@ -336,6 +338,7 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
 @property (nonatomic, strong) UIWindow *selectionWindow;
 @property (nonatomic, strong) MGOverlayWindow *overlayWindow;
 @property (nonatomic, weak) UIView *carView;
+@property (nonatomic, strong) UIView *boardView;      // 遮挡板（底色），比图片大 pad，用来盖住 3D 原车
 @property (nonatomic, strong) UIImageView *overlayView;
 @property (nonatomic, strong) UIView *adjustView;
 @property (nonatomic, strong) UIImage *carImage;
@@ -815,14 +818,82 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kKeyBgMode];
     UIColor *c = [UIColor whiteColor];
     if (mode == 1) c = [UIColor blackColor];
-    else if (mode == 2) c = [UIColor colorWithWhite:0.93 alpha:1.0];
+    else if (mode == 2) c = [UIColor colorWithWhite:0.953 alpha:1.0];   // 贴近页面浅灰底，白框不突兀
     else if (mode == 3) c = [UIColor clearColor];
-    self.overlayView.backgroundColor = c;
-    // 不透明背景时用 AspectFill 铺满，避免留白让底下的 3D 原车透出来
-    BOOL transparent = (mode == 3);
-    self.overlayView.contentMode = transparent ? UIViewContentModeScaleAspectFit
-                                               : UIViewContentModeScaleAspectFill;
-    self.overlayView.clipsToBounds = !transparent;
+    self.boardView.backgroundColor = c;
+    self.overlayView.backgroundColor = [UIColor clearColor];
+    // 默认「适应」：整张图完整显示、不裁切；「填充」才会铺满（会裁掉四周）
+    BOOL fill = [[NSUserDefaults standardUserDefaults] integerForKey:kKeyFillMode] == 1;
+    if (mode == 3) fill = NO;                 // 透明板必须完整显示，否则等于自己裁自己
+    self.overlayView.contentMode = fill ? UIViewContentModeScaleAspectFill : UIViewContentModeScaleAspectFit;
+    self.overlayView.clipsToBounds = fill;
+}
+
+- (NSString *)fillModeName {
+    return [[NSUserDefaults standardUserDefaults] integerForKey:kKeyFillMode] == 1 ? @"填充（裁切）" : @"适应（完整）";
+}
+
+- (void)toggleFillMode {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSInteger m = ([ud integerForKey:kKeyFillMode] + 1) % 2;
+    [ud setInteger:m forKey:kKeyFillMode];
+    [self applyOverlays];
+    MGLog(@"[填充] 切换为 %@", [self fillModeName]);
+    [self alertDone:[NSString stringWithFormat:@"图片显示方式：%@\n%@", [self fillModeName],
+                     m == 0 ? @"整张图完整显示，四周留底色" : @"铺满整个框，超出部分裁掉"]];
+}
+
+#pragma mark - 遮挡板外扩（原车 3D 比拖的框大，板子要往外多盖一圈）
+
+- (CGFloat)padForVC:(NSString *)vcKey {
+    if (!vcKey.length) return 0;
+    NSDictionary *m = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kKeyPadMap];
+    NSString *s = [m isKindOfClass:[NSDictionary class]] ? m[vcKey] : nil;
+    if (![s isKindOfClass:[NSString class]] || !s.length) return 0;
+    CGFloat v = [s floatValue];
+    return MAX(0, MIN(240, v));
+}
+
+- (void)setPad:(CGFloat)pad forVC:(NSString *)vcKey {
+    if (!vcKey.length) return;
+    NSMutableDictionary *m = [[[NSUserDefaults standardUserDefaults]
+                               dictionaryForKey:kKeyPadMap] mutableCopy] ?: [NSMutableDictionary new];
+    pad = MAX(0, MIN(240, pad));
+    if (pad < 1) [m removeObjectForKey:vcKey];
+    else m[vcKey] = [NSString stringWithFormat:@"%.0f", pad];
+    [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyPadMap];
+}
+
+- (void)beginPadInput {
+    UIWindow *main = [self appMainWindow];
+    if (!main) { [self unhideBall]; return; }
+    NSString *vcKey = [self currentVCKey];
+    CGFloat cur = [self padForVC:vcKey];
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"遮挡板外扩"
+                         message:[NSString stringWithFormat:
+                             @"页面 %@\n当前 %0.f pt。原车没被盖全就加大这个值（0 ~ 240）", vcKey, cur]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = [NSString stringWithFormat:@"%.0f", cur];
+        tf.placeholder = @"外扩 pt";
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    }];
+    __weak MGManager *ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+        CGFloat v = [ac.textFields.firstObject.text floatValue];
+        [ws setPad:v forVC:vcKey];
+        [ws applyOverlays];
+        MGLog(@"[外扩] 设为 %.0f pt（页面 %@）", v, vcKey);
+        [ws alertDone:[NSString stringWithFormat:
+            @"遮挡板已外扩 %.0f pt\n图片位置不变，只是多盖住一圈原车", v]];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                         handler:^(UIAlertAction *a) { [ws unhideBall]; }]];
+    UIViewController *top = [self topVC];
+    if (!top) { [self unhideBall]; return; }
+    [top presentViewController:ac animated:YES completion:nil];
 }
 
 - (NSString *)bgModeName {
@@ -853,7 +924,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     if (CGRectIsNull(n)) return NO;   // 本页没画框 → 交给视图模式
 
     if (!self.carImage) {
-        if (self.overlayView) [self unmountOverlay];
+        if (self.boardView) [self unmountOverlay];
         return YES;
     }
     [self ensureOverlayWindow];
@@ -875,27 +946,49 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
             self.origSaved = NO;
         }
     }
+    if (!self.boardView) {
+        UIView *bv = [UIView new];
+        bv.userInteractionEnabled = NO;
+        bv.autoresizingMask = UIViewAutoresizingNone;
+        self.boardView = bv;
+    }
     if (!self.overlayView) {
         UIImageView *iv = [UIImageView new];
         iv.userInteractionEnabled = NO;
         iv.autoresizingMask = UIViewAutoresizingNone;
         self.overlayView = iv;
     }
+    if (self.overlayView.superview != self.boardView) {
+        [self.overlayView removeFromSuperview];
+        [self.boardView addSubview:self.overlayView];
+    }
     [self applyBgStyle];
     CGSize R = main.bounds.size;
     CGSize lock = [self lockedSizeForVC:[self currentVCKey]];
     CGRect draw = [self fitRegion:n toSize:lock screen:R];   // 锁定优先：中心不动、尺寸固定
+    CGRect img = CGRectMake(draw.origin.x * R.width, draw.origin.y * R.height,
+                            draw.size.width * R.width, draw.size.height * R.height);
+    // 遮挡板 = 图片区域四周各外扩 pad pt，把比框还大的 3D 原车一起盖住
+    CGFloat pad = [self padForVC:[self currentVCKey]];
+    CGRect board = CGRectInset(img, -pad, -pad);
+    board = CGRectIntersection(board, host.bounds);
+    if (CGRectIsNull(board)) board = img;   // 极端情况兜底
+
     self.overlayView.image = self.carImage;
-    self.overlayView.frame = CGRectMake(draw.origin.x * R.width, draw.origin.y * R.height,
-                                        draw.size.width * R.width, draw.size.height * R.height);
-    if (self.overlayView.superview != host) {
-        [self.overlayView removeFromSuperview];
-        [host addSubview:self.overlayView];
+    self.boardView.frame = board;
+    // 图片严格贴在原区域上（板子只负责往外多盖一圈），否则图会跟着板子被缩小
+    self.overlayView.frame = CGRectMake(img.origin.x - board.origin.x,
+                                        img.origin.y - board.origin.y,
+                                        img.size.width, img.size.height);
+
+    if (self.boardView.superview != host) {
+        [self.boardView removeFromSuperview];
+        [host addSubview:self.boardView];
     } else {
-        [host bringSubviewToFront:self.overlayView];
+        [host bringSubviewToFront:self.boardView];
     }
     if (self.adjustView) {
-        self.adjustView.frame = self.overlayView.frame;
+        self.adjustView.frame = img;   // 微调框贴着图片，不是板子
         if (self.adjustView.superview != host) {
             [self.adjustView removeFromSuperview];
             [host addSubview:self.adjustView];
@@ -925,6 +1018,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 - (void)unmountOverlay {
     [self.overlayView removeFromSuperview];
     self.overlayView = nil;
+    [self.boardView removeFromSuperview];
+    self.boardView = nil;
     [self.adjustView removeFromSuperview];
     self.adjustView = nil;
     self.adjusting = NO;
@@ -954,7 +1049,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     }
     // 只走区域模式：车图是 3D 渲染（无 UIImageView 可换），本页没有区域就什么都不做
     if ([self mountRegionOverlayIfNeeded]) return;
-    if (self.overlayView) [self unmountOverlay];
+    if (self.boardView) [self unmountOverlay];
     if (self.carView) {   // 从旧模式残留的隐藏状态还原
         UIView *old = self.carView;
         self.carView = nil;
@@ -1054,6 +1149,13 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         : @"锁定当前大小（不再随缩放变化）";
     [ac addAction:[UIAlertAction actionWithTitle:lockTitle style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws toggleLockSize]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:
+        @"遮挡外扩（当前 %.0f pt，盖不住原车就加大）", [ws padForVC:[ws currentVCKey]]]
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [ws beginPadInput]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"图片显示：%@", [ws fillModeName]]
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [ws toggleFillMode]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"背景：%@（点按切换）", [ws bgModeName]]
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws cycleBgStyle]; }]];
@@ -1130,7 +1232,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                     self.carView = nil;   // 重新识别
                     [self applyOverlays];
                     MGLog(@"[选图] 已写入 %@ (%lu bytes)", path, (unsigned long)png.length);
-                    if (self.overlayView && self.overlayView.superview) {
+                    if (self.boardView && self.boardView.superview) {
                         NSString *vcKey = [self currentVCKey];
                         if (!CGRectIsNull([self regionNormForVC:vcKey])) {
                             [self alertDone:@"已替换（区域模式）\n位置不对可用「微调位置 / 大小」"];
@@ -1162,7 +1264,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     vc.view.backgroundColor = [UIColor clearColor];
     MGSelectionView *sv = [[MGSelectionView alloc] initWithFrame:vc.view.bounds];
     UILabel *hint = [UILabel new];
-    hint.text = @"按住拖出一个框，正好框住原车图";
+    hint.text = @"拖框圈住整辆车（含阴影/配件），盖不全就用「遮挡外扩」加一圈";
     hint.font = [UIFont boldSystemFontOfSize:15.0];
     hint.textColor = [UIColor whiteColor];
     hint.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
@@ -1194,7 +1296,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         }
         [ws applyOverlays];
         MGLog(@"[框选] 页面 %@ 区域 %@", vcKey, NSStringFromCGRect(r));
-        if (ws.overlayView && ws.overlayView.superview) {
+        if (ws.boardView && ws.boardView.superview) {
             [ws alertDone:[NSString stringWithFormat:
                 @"已记录区域（页面 %@）\n%@\n现在选「② 替换车辆图片（相册选图）」",
                 vcKey, NSStringFromCGRect(n)]];
@@ -1225,10 +1327,16 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     if (!CGRectIsNull(reg)) {
         CGSize R = main.bounds.size;
         CGRect draw = [self fitRegion:reg toSize:[self lockedSizeForVC:[self currentVCKey]] screen:R];
-        boxFrame = CGRectMake(draw.origin.x * R.width, draw.origin.y * R.height,
-                              draw.size.width * R.width, draw.size.height * R.height);
-        desc = [NSString stringWithFormat:@"区域模式 %@\n（页面 %@）",
-                NSStringFromCGRect(reg), [self currentVCKey]];
+        CGFloat pad = [self padForVC:[self currentVCKey]];
+        boxFrame = CGRectInset(CGRectMake(draw.origin.x * R.width, draw.origin.y * R.height,
+                                          draw.size.width * R.width, draw.size.height * R.height),
+                               -pad, -pad);
+        boxFrame = CGRectIntersection(boxFrame, main.bounds);
+        desc = [NSString stringWithFormat:@"遮挡板 %@（外扩 %.0f pt）\n图片区域 %@\n页面 %@",
+                NSStringFromCGRect(boxFrame), pad,
+                NSStringFromCGRect(CGRectMake(draw.origin.x * R.width, draw.origin.y * R.height,
+                                              draw.size.width * R.width, draw.size.height * R.height)),
+                [self currentVCKey]];
     } else {
         self.carView = nil;
         UIView *car = [self findCarView];
@@ -1266,7 +1374,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     if (!self.adjusting) {
         [self applyOverlays];   // 确保区域已挂载
     }
-    if (!self.overlayView) { [self alertDone:@"请先框选车图区域并选图，再微调"]; return; }
+    if (!self.boardView) { [self alertDone:@"请先框选车图区域并选图，再微调"]; return; }
     [self ensureOverlayWindow];
     self.ballWindow.hidden = YES;
     self.adjusting = YES;
@@ -1274,7 +1382,11 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     self.overlayWindow.userInteractionEnabled = YES;
     self.overlayWindow.rootViewController.view.userInteractionEnabled = YES;
     self.overlayWindow.hidden = NO;
-    UIView *box = [[UIView alloc] initWithFrame:self.overlayView.frame];
+    // 微调框贴着「图片」而不是遮挡板（板子可能被外扩过）
+    CGRect imgInHost = self.boardView.superview
+        ? [self.boardView convertRect:self.overlayView.frame toView:self.boardView.superview]
+        : self.boardView.frame;
+    UIView *box = [[UIView alloc] initWithFrame:imgInHost];
     box.backgroundColor = [UIColor clearColor];
     box.layer.borderColor = [UIColor colorWithRed:1.0 green:0.42 blue:0.0 alpha:0.9].CGColor;
     box.layer.borderWidth = 2.0;
@@ -1285,7 +1397,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                                                                                 action:@selector(adjustPinched:)];
     [box addGestureRecognizer:pan];
     [box addGestureRecognizer:pinch];
-    [self.overlayView.superview addSubview:box];
+    [(self.boardView.superview ?: self.overlayView.superview) addSubview:box];
     self.adjustView = box;
     CGSize lock = [self lockedSizeForVC:[self currentVCKey]];
     if (lock.width >= 20) {
@@ -1459,6 +1571,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [ud removeObjectForKey:kKeyManualMap];
     [ud removeObjectForKey:kKeyLockMap];
     [ud removeObjectForKey:kKeyLastAdjust];
+    [ud removeObjectForKey:kKeyPadMap];
+    [ud removeObjectForKey:kKeyFillMode];
     NSString *path = [MGDir() stringByAppendingPathComponent:@"car.png"];
     [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
     self.carImage = nil;
@@ -1509,8 +1623,11 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     } else {
         [out appendFormat:@"[lock] vc=%@ 未锁定\n", vcKey];
     }
-    [out appendFormat:@"[bg] %@  图片=%@\n", [self bgModeName],
-     self.carImage ? NSStringFromCGSize(self.carImage.size) : @"无"];
+    [out appendFormat:@"[pad] vc=%@ 遮挡外扩 %.0f pt\n", vcKey, [self padForVC:vcKey]];
+    [out appendFormat:@"[fill] %@\n", [self fillModeName]];
+    [out appendFormat:@"[bg] %@  图片=%@  板子=%@\n", [self bgModeName],
+     self.carImage ? NSStringFromCGSize(self.carImage.size) : @"无",
+     self.boardView ? NSStringFromCGRect(self.boardView.frame) : @"无"];
     NSArray<UIWindow *> *wins = [self appWindows];
     [out appendFormat:@"[windows] 共 %lu 个\n", (unsigned long)wins.count];
     for (UIWindow *win in wins) {
@@ -1541,7 +1658,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
      im ? NSStringFromCGSize(im.size) : @"-",
      view.layer.contents ? @"Y" : @"-",
      text.length > 30 ? [[text substringToIndex:30] stringByAppendingString:@"..."] : text,
-     view == self.overlayView ? @"<OUR-OVERLAY>" : (view == self.carView ? @"<CAR-VIEW>" : @"")];
+     view == self.boardView ? @"<OUR-BOARD>" :
+     (view == self.overlayView ? @"<OUR-OVERLAY>" : (view == self.carView ? @"<CAR-VIEW>" : @""))];
     for (UIView *sub in [view.subviews copy]) [self dump:sub to:out depth:depth + 1];
 }
 
