@@ -42,12 +42,17 @@ assert VER in os.path.basename(deb), "文件名不含版本号，拒绝发布: "
 name = os.path.basename(deb)
 print("发布", deb)
 
-body_text = """MGLiveSkin %s — MG Live 车辆状态页车图换装（roothide / arm64e）
+body_text = """MGLiveSkin %s — MG Live 车辆图片换装（roothide / arm64e）
+
+**本版更新（0.1.8）**
+- 新增「锁定当前大小 / 解锁大小」：按页面各自记住尺寸，锁定后图片大小不再随缩放变化，位置仍可拖动
+- 锁定时「① 框选车图区域」「自定义大小」会同步更新锁定值，不会被旧值压回去
+- 诊断新增 `[lock]` 行，与 `[region]` / `[lastAdjust]` 一起定位尺寸问题
 
 安装：Sileo 添加源后直接安装，或手机浏览器打开下方 deb 链接用 Filza 安装；装完**杀掉 MG Live 后台重开**。
-使用：进入 MG Live「车辆状态」页 → 点右侧「换装」悬浮球 → 替换车辆图片（相册）→ 如位置不对选「微调位置 / 大小」→ 点悬浮球结束微调。
-诊断：自动识别失败时选「手动框选原车图」，或「导出视图树」后把 /var/mobile/Documents/MGLiveSkin/viewtree.txt 发回。
-恢复：菜单「恢复原车图」。日志同目录 log.txt。
+使用：爱车页 / 车辆状态页 → 点右侧「换装」悬浮球 →「① 框选车图区域」拖框 →「② 替换车辆图片」选图 →「微调位置 / 大小」或「自定义大小」→「锁定当前大小」。
+诊断：菜单「导出视图树（诊断）」后把 /var/mobile/Documents/MGLiveSkin/viewtree.txt 发回。
+恢复：菜单「恢复原车图」（区域、锁定、图片、尺寸记录一并清空）。日志同目录 log.txt。
 """ % VER
 
 rel = call("POST", API + "/repos/%s/releases" % REPO,
