@@ -178,8 +178,28 @@ static NSData *MGPrepareCarPNG(NSData *data) {
     BOOL opaque = YES;
     for (size_t i = 0; i < px; i++) { if (p[i * 4 + 3] < 250) { opaque = NO; break; } }
     if (opaque) {
-        size_t filled = MGStripWhite(p, (int)w, (int)h);
-        if (filled > px * 9 / 10) { CGContextRelease(ctx); return MGPNGData(data); }
+        // 只有四角都是近白时才敢去底：白底 + 白车的图，泛洪会把车身一起吃掉，
+        // 结果整张图几乎全透明 → 用户看到「完全不生效」
+        int cs[4][2] = {{2, 2}, {(int)w - 3, 2}, {2, (int)h - 3}, {(int)w - 3, (int)h - 3}};
+        BOOL cornersWhite = YES;
+        for (int k = 0; k < 4; k++) {
+            uint8_t *q = p + ((size_t)cs[k][1] * (size_t)w + (size_t)cs[k][0]) * 4;
+            if (!(q[0] >= 243 && q[1] >= 243 && q[2] >= 243)) { cornersWhite = NO; break; }
+        }
+        if (cornersWhite) {
+            size_t filled = MGStripWhite(p, (int)w, (int)h);
+            size_t left = 0;
+            for (size_t i = 0; i < px; i++) { if (p[i * 4 + 3] > 8) left++; }
+            double ratio = (double)left / (double)px;
+            MGLog(@"[图片] 去底 filled=%.1f%% 剩余=%.1f%%",
+                  (double)filled * 100.0 / (double)px, ratio * 100.0);
+            if (filled > px * 9 / 10 || ratio < 0.20) {
+                // 去太多（车身也被当背景吃了）→ 直接用原图，保证看得见
+                CGContextRelease(ctx);
+                MGLog(@"[图片] 去底过度，回退原图");
+                return MGPNGData(data);
+            }
+        }
     }
     CGRect box = MGOpaqueBounds(p, (int)w, (int)h);
     CGImageRef full = CGBitmapContextCreateImage(ctx);
@@ -241,6 +261,12 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
     if (!hit || hit == self || hit == self.rootViewController.view) return nil;
     return hit;
 }
+@end
+
+// 覆盖专用窗口：挂在独立 UIWindow 上，不受 App 布局/重排影响，保证一定可见
+@interface MGOverlayWindow : UIWindow
+@end
+@implementation MGOverlayWindow
 @end
 
 @interface MGSelectionView : UIView
@@ -305,6 +331,7 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
 @property (nonatomic, strong) UIWindow *ballWindow;
 @property (nonatomic, strong) UIButton *ballButton;
 @property (nonatomic, strong) UIWindow *selectionWindow;
+@property (nonatomic, strong) MGOverlayWindow *overlayWindow;
 @property (nonatomic, weak) UIView *carView;
 @property (nonatomic, strong) UIImageView *overlayView;
 @property (nonatomic, strong) UIView *adjustView;
@@ -403,6 +430,7 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *w in ((UIWindowScene *)sc).windows) {
             if (w == self.ballWindow || w == self.selectionWindow) continue;
+            if (w == self.overlayWindow) continue;
             if (w.hidden || !w.rootViewController) continue;
             if ([self isSystemInputWindow:w]) continue;
             [out addObject:w];
@@ -681,19 +709,42 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyRegionMap];
 }
 
+- (void)ensureOverlayWindow {
+    if (self.overlayWindow) return;
+    UIWindow *main = [self appMainWindow];
+    CGRect f = main ? main.bounds : [UIScreen mainScreen].bounds;
+    MGOverlayWindow *w = [[MGOverlayWindow alloc] initWithFrame:f];
+    w.windowLevel = UIWindowLevelNormal + 1.0;
+    w.backgroundColor = [UIColor clearColor];
+    w.userInteractionEnabled = NO;          // 默认穿透，不挡 App 操作
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = [UIColor clearColor];
+    vc.view.userInteractionEnabled = NO;
+    w.rootViewController = vc;
+    w.hidden = NO;
+    self.overlayWindow = w;
+    MGLog(@"[覆盖窗口] 已创建 level=%.0f frame=%@", w.windowLevel, NSStringFromCGRect(f));
+}
+
 // 按当前页面的区域配置挂载覆盖图；没有配置则返回 NO
 - (BOOL)mountRegionOverlayIfNeeded {
-    UIWindow *win = [self appMainWindow];
-    UIView *root = win.rootViewController.view;
-    if (!win || !root) return NO;
+    UIWindow *main = [self appMainWindow];
+    if (!main) return NO;
     CGRect n = [self regionNormForVC:[self currentVCKey]];
     if (CGRectIsNull(n)) return NO;   // 本页没画框 → 交给视图模式
 
     if (!self.carImage) {
-        // 区域已定但还没选图：清掉旧 overlay，且不再回落到视图模式
         if (self.overlayView) [self unmountOverlay];
         return YES;
     }
+    [self ensureOverlayWindow];
+    UIView *host = self.overlayWindow.rootViewController.view;
+    if (!host) return NO;
+    // 窗口尺寸跟随主窗口（横竖屏/机型变化）
+    if (!CGSizeEqualToSize(self.overlayWindow.bounds.size, main.bounds.size)) {
+        self.overlayWindow.frame = main.bounds;
+    }
+
     // 从旧模式切过来：先把被隐藏的原图还原
     if (self.carView) {
         UIView *old = self.carView;
@@ -714,24 +765,25 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         iv.autoresizingMask = UIViewAutoresizingNone;
         self.overlayView = iv;
     }
-    CGSize R = root.bounds.size;
+    CGSize R = main.bounds.size;
     self.overlayView.image = self.carImage;
     self.overlayView.frame = CGRectMake(n.origin.x * R.width, n.origin.y * R.height,
                                         n.size.width * R.width, n.size.height * R.height);
-    if (self.overlayView.superview != root) {
+    if (self.overlayView.superview != host) {
         [self.overlayView removeFromSuperview];
-        [root addSubview:self.overlayView];
+        [host addSubview:self.overlayView];
     } else {
-        [root bringSubviewToFront:self.overlayView];
+        [host bringSubviewToFront:self.overlayView];
     }
     if (self.adjustView) {
         self.adjustView.frame = self.overlayView.frame;
-        if (self.adjustView.superview != root) {
+        if (self.adjustView.superview != host) {
             [self.adjustView removeFromSuperview];
-            [root addSubview:self.adjustView];
+            [host addSubview:self.adjustView];
         }
-        [root bringSubviewToFront:self.adjustView];
+        [host bringSubviewToFront:self.adjustView];
     }
+    self.overlayWindow.hidden = NO;
     return YES;
 }
 
@@ -757,6 +809,10 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [self.adjustView removeFromSuperview];
     self.adjustView = nil;
     self.adjusting = NO;
+    if (self.overlayWindow) {
+        self.overlayWindow.hidden = YES;
+        self.overlayWindow.userInteractionEnabled = NO;
+    }
 }
 
 - (void)restoreCar:(UIView *)car {
@@ -1025,21 +1081,18 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 
 // 调试：橙色高亮显示当前生效的位置（区域模式或视图模式），5 秒后消失
 - (void)testHit {
-    UIWindow *win = [self appMainWindow];
-    UIView *root = win.rootViewController.view;
-    if (!win || !root) { [self alertDone:@"没有可用窗口"]; return; }
+    UIWindow *main = [self appMainWindow];
+    if (!main) { [self alertDone:@"没有可用窗口"]; return; }
 
-    CGRect n = [self regionNormForVC:[self currentVCKey]];
-    UIView *host = root;
+    CGRect reg = [self regionNormForVC:[self currentVCKey]];
     CGRect boxFrame = CGRectNull;
     NSString *desc = nil;
-
-    if (!CGRectIsNull(n)) {
-        CGSize R = root.bounds.size;
-        boxFrame = CGRectMake(n.origin.x * R.width, n.origin.y * R.height,
-                              n.size.width * R.width, n.size.height * R.height);
+    if (!CGRectIsNull(reg)) {
+        CGSize R = main.bounds.size;
+        boxFrame = CGRectMake(reg.origin.x * R.width, reg.origin.y * R.height,
+                              reg.size.width * R.width, reg.size.height * R.height);
         desc = [NSString stringWithFormat:@"区域模式 %@\n（页面 %@）",
-                NSStringFromCGRect(n), [self currentVCKey]];
+                NSStringFromCGRect(reg), [self currentVCKey]];
     } else {
         self.carView = nil;
         UIView *car = [self findCarView];
@@ -1047,20 +1100,22 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
             [self alertDone:@"当前页面还没有记录区域\n请用「① 框选车图区域」拖一个框"];
             return;
         }
-        host = car.superview;
-        boxFrame = [car convertRect:car.bounds toView:host];
+        boxFrame = [car convertRect:car.bounds toView:main];
         desc = [NSString stringWithFormat:@"视图模式 %@\nframe=%@",
                 NSStringFromClass([car class]), NSStringFromCGRect(car.frame)];
     }
 
+    [self ensureOverlayWindow];
+    UIView *host = self.overlayWindow.rootViewController.view;
     UIView *box = [[UIView alloc] initWithFrame:boxFrame];
     box.backgroundColor = [[UIColor colorWithRed:1.0 green:0.42 blue:0.0 alpha:0.45] colorWithAlphaComponent:0.45];
     box.layer.borderColor = [UIColor whiteColor].CGColor;
-    box.layer.borderWidth = 2.0;
+    box.layer.borderWidth = 3.0;
     box.userInteractionEnabled = NO;
     box.tag = 9527;
     [host addSubview:box];
     [host bringSubviewToFront:box];
+    self.overlayWindow.hidden = NO;
     MGLog(@"[测试] 高亮 %@", desc);
     __weak UIView *wbox = box;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
@@ -1072,9 +1127,17 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 #pragma mark - 微调
 
 - (void)beginAdjust {
-    if (!self.overlayView) { [self alertDone:@"请先替换车辆图片，再微调"]; return; }
+    if (!self.adjusting) {
+        [self applyOverlays];   // 确保区域已挂载
+    }
+    if (!self.overlayView) { [self alertDone:@"请先框选车图区域并选图，再微调"]; return; }
+    [self ensureOverlayWindow];
     self.ballWindow.hidden = YES;
     self.adjusting = YES;
+    // 临时允许触摸，让拖动/缩放生效
+    self.overlayWindow.userInteractionEnabled = YES;
+    self.overlayWindow.rootViewController.view.userInteractionEnabled = YES;
+    self.overlayWindow.hidden = NO;
     UIView *box = [[UIView alloc] initWithFrame:self.overlayView.frame];
     box.backgroundColor = [UIColor clearColor];
     box.layer.borderColor = [UIColor colorWithRed:1.0 green:0.42 blue:0.0 alpha:0.9].CGColor;
@@ -1148,6 +1211,11 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [self.adjustView removeFromSuperview];
     self.adjustView = nil;
     self.adjusting = NO;
+    // 恢复穿透，不挡 App 操作
+    if (self.overlayWindow) {
+        self.overlayWindow.userInteractionEnabled = NO;
+        self.overlayWindow.rootViewController.view.userInteractionEnabled = NO;
+    }
     [self unhideBall];
     [self alertDone:@"微调已保存"];
 }
