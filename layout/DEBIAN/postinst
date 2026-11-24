@@ -1,0 +1,4 @@
+#!/bin/bash
+mkdir -p /var/mobile/Documents/MGLiveSkin
+chmod 777 /var/mobile/Documents/MGLiveSkin
+exit 0
