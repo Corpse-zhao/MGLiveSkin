@@ -328,19 +328,29 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
 #pragma mark - 窗口与页面
 
 - (UIWindow *)appMainWindow {
-    UIWindow *best = nil;
+    return [self appWindows].firstObject;
+}
+
+// 所有 App 窗口（排除插件自己的），按 windowLevel 降序、keyWindow 优先。
+// MG Live 疑似多窗口架构，车图页可能不在主窗口——识别/框选/导出必须全窗口覆盖。
+- (NSArray<UIWindow *> *)appWindows {
+    NSMutableArray<UIWindow *> *out = [NSMutableArray new];
     for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *w in ((UIWindowScene *)sc).windows) {
             if (w == self.ballWindow || w == self.selectionWindow) continue;
             if (w.hidden || !w.rootViewController) continue;
-            if (w.windowLevel != UIWindowLevelNormal) continue;
-            best = w;
-            break;
+            [out addObject:w];
         }
-        if (best) break;
     }
-    return best;
+    [out sortUsingComparator:^NSComparisonResult(UIWindow *a, UIWindow *b) {
+        if (a.windowLevel > b.windowLevel) return NSOrderedAscending;
+        if (a.windowLevel < b.windowLevel) return NSOrderedDescending;
+        if (a.isKeyWindow) return NSOrderedAscending;
+        if (b.isKeyWindow) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return out;
 }
 
 - (UIViewController *)topVC {
@@ -389,26 +399,155 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                                  @"蓝牙控制", @"寻车", @"后备箱", @"主驾加热"], 0);
 }
 
-// 自动识别车图：按尺寸/比例/位置/页面特征打分。
-// 手动框选过的 class 拥有最高优先级，且跳过页面判断。
+// 自动识别车图：按尺寸/比例/位置/页面特征打分，扫描所有 App 窗口。
+// 手动框选过的配置（class+父视图+尺寸）拥有最高优先级，且跳过页面判断。
 - (UIView *)findCarView {
     UIView *cached = self.carView;
     if (cached && cached.superview && cached.window) return cached;
 
-    UIWindow *win = [self appMainWindow];
-    UIView *root = win.rootViewController.view;
-    if (!win || !root) return nil;
-    CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
-    if (W < 100 || H < 100) return nil;
-
-    // 手动指定过 class：按「当前页面 VC 类名」取配置，整个窗口树找该 class
-    // 的最大可见图像视图（≥60% 落在屏幕内），不卡页面文字
     UIViewController *vcNow = [self topVC];
     NSString *vcKey = NSStringFromClass([vcNow class]);
     NSDictionary *map = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kKeyManualMap];
-    NSString *manual = map[vcKey];
-    if (manual.length) {
-        MGLog(@"[识别] 页面 %@ 使用手动配置 %@", vcKey, manual);
+    id rawCfg = map[vcKey];
+    NSString *mCls = nil, *mSup = nil;
+    CGFloat mW = 0, mH = 0;
+    if ([rawCfg isKindOfClass:[NSString class]]) {          // 旧格式：仅 class
+        mCls = rawCfg;
+    } else if ([rawCfg isKindOfClass:[NSDictionary class]]) {
+        mCls = rawCfg[@"cls"];
+        mSup = rawCfg[@"sup"];
+        mW = [rawCfg[@"w"] floatValue];
+        mH = [rawCfg[@"h"] floatValue];
+    }
+
+    UIView *autoBest = nil;
+    CGFloat autoBestScore = 0;
+    UIWindow *autoWin = nil;
+    BOOL anyPageOK = NO;
+
+    for (UIWindow *win in [self appWindows]) {
+        UIView *root = win.rootViewController.view;
+        if (!root) continue;
+        CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
+        if (W < 100 || H < 100) continue;
+
+        // ---- 手动路径：class + 父视图 + 尺寸，逐级放宽 ----
+        if (mCls.length) {
+            struct { NSString *sup; BOOL needSize; int pass; } passes[] = {
+                { mSup, YES, 1 },   // 全匹配
+                { mSup, NO,  2 },   // class + 父视图
+                { nil,  NO,  3 },   // 仅 class
+            };
+            for (int pi = 0; pi < 3; pi++) {
+                NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+                UIView *best = nil;
+                CGFloat bestArea = 0;
+                while (stack.count) {
+                    UIView *v = stack.lastObject;
+                    [stack removeLastObject];
+                    if (v == self.overlayView || v == self.adjustView) continue;
+                    if (!v.hidden && v.alpha > 0.05 &&
+                        [NSStringFromClass([v class]) isEqualToString:mCls]) {
+                        CGSize b = v.bounds.size;
+                        if (b.width >= 50 && b.height >= 50) {
+                            if (passes[pi].sup.length &&
+                                ![NSStringFromClass([v.superview class]) isEqualToString:passes[pi].sup]) {
+                                if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
+                                continue;
+                            }
+                            if (passes[pi].needSize) {
+                                CGFloat dw = fabs(b.width - mW) / MAX(mW, 1.0);
+                                CGFloat dh = fabs(b.height - mH) / MAX(mH, 1.0);
+                                if (dw > 0.35 || dh > 0.35) {
+                                    if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
+                                    continue;
+                                }
+                            }
+                            CGRect fr = [v convertRect:v.bounds toView:root];
+                            CGRect vis = CGRectIntersection(fr, root.bounds);
+                            if (vis.size.width * vis.size.height >= b.width * b.height * 0.6) {
+                                CGFloat area = b.width * b.height;
+                                if (area > bestArea) { bestArea = area; best = v; }
+                            }
+                        }
+                    }
+                    if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
+                }
+                if (best) {
+                    self.carView = best;
+                    MGLog(@"[识别] 手动配置命中(P%d 窗口 %@) %@ frame=%@ superview=%@",
+                          passes[pi].pass, NSStringFromClass([win class]),
+                          NSStringFromClass([best class]), NSStringFromCGRect(best.frame),
+                          NSStringFromClass([best.superview class]));
+                    return best;
+                }
+            }
+            continue;   // 此窗口没有手动目标，继续下一个窗口（不回退自动，避免误命中）
+        }
+
+        // ---- 自动路径 ----
+        BOOL pageOK = [self onVehicleStatusPage:root vc:vcNow];
+        if (!pageOK) continue;
+        anyPageOK = YES;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+        while (stack.count) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if (v == self.overlayView || v == self.adjustView) continue;
+            UIImage *im = [v isKindOfClass:[UIImageView class]] ? ((UIImageView *)v).image : nil;
+            BOOL hasVisual = (im != nil || v.layer.contents != NULL);
+            if (hasVisual && !v.hidden && v.alpha > 0.05) {
+                CGSize b = v.bounds.size;
+                CGRect inRoot = [v convertRect:v.bounds toView:root];
+                CGRect vis = CGRectIntersection(inRoot, root.bounds);
+                if (vis.size.width * vis.size.height < b.width * b.height * 0.6) continue;
+                CGFloat ratio = b.height / MAX(b.width, 1.0);
+                BOOL sizeOK = (b.width >= 90 && b.width <= W * 0.85 &&
+                               b.height >= 110 && b.height <= H * 0.75 &&
+                               ratio >= 0.25 && ratio <= 6.0);
+                BOOL bgLike = (b.width >= W * 0.98 && b.height >= H * 0.9);
+                CGFloat midX = CGRectGetMidX(inRoot);
+                BOOL centerOK = (midX > W * 0.10 && midX < W * 0.90);
+                if (sizeOK && centerOK && !bgLike) {
+                    CGFloat score = (b.width * b.height) / (W * H) * 10.0;
+                    if (im) score += 2.0;
+                    for (UIView *p = v.superview; p && p != root; p = p.superview) {
+                        if ([p isKindOfClass:[UIControl class]]) { score += 8.0; break; }
+                    }
+                    NSString *cn = NSStringFromClass([v class]);
+                    if ([cn containsString:@"Car"] || [cn containsString:@"Vehicle"] ||
+                        [cn containsString:@"Status"]) score += 6.0;
+                    if (score > autoBestScore) { autoBestScore = score; autoBest = v; autoWin = win; }
+                }
+            }
+            if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
+        }
+    }
+
+    if (mCls.length) {
+        MGLog(@"[识别] 手动配置 %@ 在所有窗口未找到", mCls);
+        return nil;
+    }
+    if (autoBestScore < 3.0 || !autoBest) {
+        MGLog(@"[识别] 未找到车图（page=%@ anyPageOK=%d 最高分 %.2f）",
+              vcKey, (int)anyPageOK, autoBestScore);
+        return nil;
+    }
+    self.carView = autoBest;
+    MGLog(@"[识别] 自动命中(窗口 %@) %@ frame=%@ score=%.2f",
+          NSStringFromClass([autoWin class]), NSStringFromClass([autoBest class]),
+          NSStringFromCGRect(autoBest.frame), autoBestScore);
+    return autoBest;
+}
+
+// 手动框选时，按落点找图片视图：从最上层窗口往下扫，
+// 在包含落点的候选里选面积最大的非背景图（避免选中全屏背景）
+- (UIView *)findImageViewNearPoint:(CGPoint)p inWindow:(UIWindow *)ignored {
+    for (UIWindow *win in [self appWindows]) {
+        UIView *root = win.rootViewController.view;
+        if (!root) continue;
+        CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
+        CGFloat maxArea = W * H * 0.6;   // 超过屏幕 60% 的当背景排除
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
         UIView *best = nil;
         CGFloat bestArea = 0;
@@ -416,112 +555,26 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
             UIView *v = stack.lastObject;
             [stack removeLastObject];
             if (v == self.overlayView || v == self.adjustView) continue;
-            if (!v.hidden && v.alpha > 0.05 &&
-                [NSStringFromClass([v class]) isEqualToString:manual]) {
-                CGSize b = v.bounds.size;
-                if (b.width >= 50 && b.height >= 50) {
-                    CGRect fr = [v convertRect:v.bounds toView:root];
-                    CGRect vis = CGRectIntersection(fr, root.bounds);
-                    // 必须至少 60% 落在屏幕内，排除滚出屏幕的 cell
-                    if (vis.size.width * vis.size.height >= b.width * b.height * 0.6) {
-                        CGFloat area = b.width * b.height;
-                        if (area > bestArea) { bestArea = area; best = v; }
+            UIImage *im = [v isKindOfClass:[UIImageView class]] ? ((UIImageView *)v).image : nil;
+            if (im || v.layer.contents) {
+                CGRect r = [v convertRect:v.bounds toView:win];
+                if (CGRectContainsPoint(r, p) && !v.hidden && v.alpha > 0.05) {
+                    CGFloat area = r.size.width * r.size.height;
+                    if (area > bestArea && area <= maxArea &&
+                        r.size.width >= 50 && r.size.height >= 50) {
+                        bestArea = area;
+                        best = v;
                     }
                 }
             }
             if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
         }
         if (best) {
-            self.carView = best;
-            MGLog(@"[识别] 手动 class 命中 %@ frame=%@ superview=%@",
-                  NSStringFromClass([best class]), NSStringFromCGRect(best.frame),
-                  NSStringFromClass([best.superview class]));
+            MGLog(@"[框选] 命中于窗口 %@ level=%.0f", NSStringFromClass([win class]), win.windowLevel);
             return best;
         }
-        MGLog(@"[识别] 手动 class %@ 在当前页面未找到，回退自动识别", manual);
     }
-
-    UIViewController *vc = vcNow;
-    BOOL pageOK = [self onVehicleStatusPage:root vc:vc];
-    if (!pageOK) return nil;   // 未手动框选且页面不匹配时仍不动手，避免乱替换
-
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    UIView *best = nil;
-    CGFloat bestScore = 0;
-    while (stack.count) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        if (v == self.overlayView || v == self.adjustView) continue;
-        UIImage *im = [v isKindOfClass:[UIImageView class]] ? ((UIImageView *)v).image : nil;
-        BOOL hasVisual = (im != nil || v.layer.contents != NULL);
-        if (hasVisual && !v.hidden && v.alpha > 0.05) {
-            CGSize b = v.bounds.size;
-            CGRect inRoot = [v convertRect:v.bounds toView:root];
-            // 必须至少 60% 落在屏幕内，排除滚出屏幕的 cell（0.1.1 命中屏外图的主因）
-            CGRect vis = CGRectIntersection(inRoot, root.bounds);
-            if (vis.size.width * vis.size.height < b.width * b.height * 0.6) continue;
-            CGFloat ratio = b.height / MAX(b.width, 1.0);   // 高/宽
-            // 横图 / 方图 / 竖图都认：爱车页横车高约 130（0.1.2 被 h>=140 卡掉）
-            BOOL sizeOK = (b.width >= 90 && b.width <= W * 0.85 &&
-                           b.height >= 110 && b.height <= H * 0.75 &&
-                           ratio >= 0.25 && ratio <= 6.0);
-            // 排除明显的全屏背景图
-            BOOL bgLike = (b.width >= W * 0.98 && b.height >= H * 0.9);
-            CGFloat midX = CGRectGetMidX(inRoot);
-            BOOL centerOK = (midX > W * 0.10 && midX < W * 0.90);
-            if (sizeOK && centerOK && !bgLike) {
-                CGFloat score = (b.width * b.height) / (W * H) * 10.0;
-                if (im) score += 2.0;
-                for (UIView *p = v.superview; p && p != root; p = p.superview) {
-                    if ([p isKindOfClass:[UIControl class]]) { score += 8.0; break; }
-                }
-                NSString *cn = NSStringFromClass([v class]);
-                if ([cn containsString:@"Car"] || [cn containsString:@"Vehicle"] ||
-                    [cn containsString:@"Status"]) score += 6.0;
-                if (score > bestScore) { bestScore = score; best = v; }
-            }
-        }
-        if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
-    }
-    if (bestScore < 3.0) {
-        MGLog(@"[识别] 未找到车图（page=%@ pageOK=%d 最高分 %.2f）", vcKey, (int)pageOK, bestScore);
-        return nil;
-    }
-    self.carView = best;
-    MGLog(@"[识别] 命中 %@ frame=%@ score=%.2f", NSStringFromClass([best class]),
-          NSStringFromCGRect(best.frame), bestScore);
-    return best;
-}
-
-// 手动框选时，按落点找图片视图：
-// 在包含落点的候选里选面积最大的非背景图（避免选中全屏背景）
-- (UIView *)findImageViewNearPoint:(CGPoint)p inWindow:(UIWindow *)win {
-    UIView *root = win.rootViewController.view;
-    if (!root) return nil;
-    CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
-    CGFloat maxArea = W * H * 0.6;   // 超过屏幕 60% 的当背景排除
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    UIView *best = nil;
-    CGFloat bestArea = 0;
-    while (stack.count) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        if (v == self.overlayView || v == self.adjustView) continue;
-        UIImage *im = [v isKindOfClass:[UIImageView class]] ? ((UIImageView *)v).image : nil;
-        if (im || v.layer.contents) {
-            CGRect r = [v convertRect:v.bounds toView:win];
-            if (CGRectContainsPoint(r, p) && !v.hidden && v.alpha > 0.05) {
-                CGFloat area = r.size.width * r.size.height;
-                if (area > bestArea && area <= maxArea &&
-                    r.size.width >= 50 && r.size.height >= 50) {
-                    bestArea = area;
-                    best = v;
-                }
-            }
-        }
-        if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
-    }
-    return best;
+    return nil;
 }
 
 #pragma mark - 覆盖 / 还原
@@ -839,17 +892,20 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         [ws unmountOverlay];
         ws.carView = found;
         ws.origSaved = NO;
-        // 按「当前页面 VC 类名」记忆，各页面互不影响
+        // 按「当前页面 VC 类名」记忆 class+父视图+尺寸，各页面互不影响
         NSString *vcKey = NSStringFromClass([[ws topVC] class]);
         NSMutableDictionary *m = [[[NSUserDefaults standardUserDefaults]
                                    dictionaryForKey:kKeyManualMap] mutableCopy] ?: [NSMutableDictionary new];
-        m[vcKey] = NSStringFromClass([found class]);
+        m[vcKey] = @{@"cls": NSStringFromClass([found class]),
+                     @"sup": NSStringFromClass([found.superview class] ?: [NSObject class]),
+                     @"w": @(found.bounds.size.width),
+                     @"h": @(found.bounds.size.height)};
         [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyManualMap];
         [ws applyOverlays];
         MGLog(@"[框选] 页面 %@ 手动选中 %@ frame=%@", vcKey,
               NSStringFromClass([found class]), NSStringFromCGRect(found.frame));
         [ws alertDone:[NSString stringWithFormat:
-            @"已选中 %@（页面 %@）\n先选图再框选也行：菜单「替换车辆图片（相册）」",
+            @"已选中 %@（页面 %@）\n先选图再框选也行：菜单「替换车辆图片（相册选图）」",
             NSStringFromClass([found class]), vcKey]];
     };
 }
@@ -975,20 +1031,21 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     UIViewController *vc = [self topVC];
     [out appendFormat:@"[topVC] %@ title=%@ navTitle=%@\n", NSStringFromClass([vc class]),
      vc.title ?: @"-", vc.navigationItem.title ?: @"-"];
-    UIWindow *win = [self appMainWindow];
-    if (win) {
-        [out appendFormat:@"[window] %@ bounds=%@\n", NSStringFromClass([win class]),
-         NSStringFromCGRect(win.bounds)];
-        [self dump:win.rootViewController.view to:out depth:0];
-    } else {
-        [out appendString:@"[window] nil\n"];
+    NSArray<UIWindow *> *wins = [self appWindows];
+    [out appendFormat:@"[windows] 共 %lu 个\n", (unsigned long)wins.count];
+    for (UIWindow *win in wins) {
+        [out appendFormat:@"[window] %@ level=%.0f key=%d bounds=%@ root=%@\n",
+         NSStringFromClass([win class]), win.windowLevel, (int)win.isKeyWindow,
+         NSStringFromCGRect(win.bounds), NSStringFromClass([win.rootViewController class])];
+        [self dump:win.rootViewController.view to:out depth:1];
     }
+    if (!wins.count) [out appendString:@"[windows] 无可见窗口\n"];
     NSString *path = [MGDir() stringByAppendingPathComponent:@"viewtree.txt"];
     [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    MGLog(@"[诊断] 导出 %lu 字节", (unsigned long)out.length);
+    MGLog(@"[诊断] 导出 %lu 字节（%lu 窗口）", (unsigned long)out.length, (unsigned long)wins.count);
     [self unhideBall];
-    [self alertDone:[NSString stringWithFormat:@"已导出视图树（当前页面 %@）：\n%@",
-                     NSStringFromClass([vc class]), path]];
+    [self alertDone:[NSString stringWithFormat:@"已导出 %lu 个窗口的视图树：\n%@",
+                     (unsigned long)wins.count, path]];
 }
 
 - (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {
