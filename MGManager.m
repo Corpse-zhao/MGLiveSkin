@@ -1187,6 +1187,11 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                               r.size.width / W, r.size.height / H);
         NSString *vcKey = [ws currentVCKey];
         [ws saveRegion:n forVC:vcKey];
+        // 已锁定 → 重新框选视为新的锁定尺寸（否则大框会被旧锁定值压回去）
+        if ([ws lockedSizeForVC:vcKey].width >= 20) {
+            [ws setLockedSize:CGSizeMake(r.size.width, r.size.height) forVC:vcKey];
+            MGLog(@"[锁定] 随框选更新为 %.1f × %.1f pt", r.size.width, r.size.height);
+        }
         [ws applyOverlays];
         MGLog(@"[框选] 页面 %@ 区域 %@", vcKey, NSStringFromCGRect(r));
         if (ws.overlayView && ws.overlayView.superview) {
