@@ -6,8 +6,9 @@
 
 // ---------------- 常量 ----------------
 static NSString * const kKeyCarRect      = @"mgliveskin_car_rect";
-static NSString * const kKeyManualMap    = @"mgliveskin_manual_map";   // {VC类名: 视图类名}
-static NSString * const kKeyManualClass  = @"mgliveskin_manual_class"; // 旧版单值，boot 时清除
+static NSString * const kKeyRegionMap    = @"mgliveskin_region_map";   // {VC类名: "x,y,w,h"} 归一化屏幕坐标
+static NSString * const kKeyManualMap    = @"mgliveskin_manual_map";   // 旧版视图类匹配，boot 清除
+static NSString * const kKeyManualClass  = @"mgliveskin_manual_class"; // 旧版单值，boot 清除
 static NSString * const kKeyBallHidden   = @"mgliveskin_ball_hidden";
 
 // ---------------- 日志 ----------------
@@ -243,13 +244,60 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
 @end
 
 @interface MGSelectionView : UIView
-@property (nonatomic, copy) void (^pick)(CGPoint p);
+@property (nonatomic, copy) void (^pickRect)(CGRect r);   // self 坐标系
 @end
-@implementation MGSelectionView
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    CGPoint p = [[touches anyObject] locationInView:self];
-    if (self.pick) self.pick(p);
+
+@implementation MGSelectionView {
+    CGPoint _start;
+    CGRect _cur;
+    CAShapeLayer *_box;
+    BOOL _dragging;
 }
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.backgroundColor = [UIColor clearColor];
+        self.multipleTouchEnabled = NO;
+        _box = [CAShapeLayer layer];
+        _box.fillColor = [[UIColor colorWithRed:1.0 green:0.42 blue:0.0 alpha:0.18] CGColor];
+        _box.strokeColor = [[UIColor colorWithRed:1.0 green:0.42 blue:0.0 alpha:0.95] CGColor];
+        _box.lineWidth = 2.0;
+        _box.lineDashPattern = @[@6, @4];
+        _box.hidden = YES;
+        [self.layer addSublayer:_box];
+    }
+    return self;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    _start = [[touches anyObject] locationInView:self];
+    _cur = CGRectMake(_start.x, _start.y, 0, 0);
+    _dragging = YES;
+    _box.hidden = NO;
+    _box.path = nil;
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!_dragging) return;
+    CGPoint p = [[touches anyObject] locationInView:self];
+    _cur = CGRectMake(MIN(_start.x, p.x), MIN(_start.y, p.y),
+                      fabs(p.x - _start.x), fabs(p.y - _start.y));
+    _box.path = [UIBezierPath bezierPathWithRect:_cur].CGPath;
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!_dragging) return;
+    _dragging = NO;
+    _box.hidden = YES;
+    CGRect r = _cur;
+    if (r.size.width < 40 || r.size.height < 40) {
+        // 只点了一下：用点为中心给个默认框（后续可微调）
+        r = CGRectMake(_start.x - 150, _start.y - 130, 300, 260);
+    }
+    r = CGRectIntersection(r, self.bounds);
+    if (self.pickRect) self.pickRect(r);
+}
+
 @end
 
 // ---------------- 管理器 ----------------
@@ -283,10 +331,11 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         MGLog(@"========== MGLiveSkin %@ boot ==========", MG_VERSION);
-        // 清理历史遗留：0.1.1 的隐藏标记（死胡同）与 0.1.2 前的单值手动 class（跨页误命中）
+        // 清理历史遗留：0.1.1 的隐藏标记（死胡同）、0.1.4 前的视图类匹配配置（跨页误命中）
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         [ud removeObjectForKey:kKeyBallHidden];
         [ud removeObjectForKey:kKeyManualClass];
+        [ud removeObjectForKey:kKeyManualMap];
         [self installHiddenHook];
         // App 启动后 scene 才就绪，做多轮补装
         for (int i = 1; i <= 8; i++) {
@@ -328,11 +377,26 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
 #pragma mark - 窗口与页面
 
 - (UIWindow *)appMainWindow {
-    return [self appWindows].firstObject;
+    // 优先 keyWindow 且排除键盘/文本特效窗口（0.1.4 曾误取到 UIInputWindowController）
+    NSArray<UIWindow *> *wins = [self appWindows];
+    for (UIWindow *w in wins) {
+        if (w.isKeyWindow && ![self isSystemInputWindow:w]) return w;
+    }
+    for (UIWindow *w in wins) {
+        if (![self isSystemInputWindow:w]) return w;
+    }
+    return nil;
+}
+
+- (BOOL)isSystemInputWindow:(UIWindow *)w {
+    NSString *rc = NSStringFromClass([w.rootViewController class]);
+    if ([rc containsString:@"Input"] || [rc containsString:@"TextEffects"]) return YES;
+    if ([NSStringFromClass([w class]) containsString:@"TextEffects"]) return YES;
+    if (w.windowLevel >= UIWindowLevelAlert) return YES;   // 系统弹层
+    return NO;
 }
 
 // 所有 App 窗口（排除插件自己的），按 windowLevel 降序、keyWindow 优先。
-// MG Live 疑似多窗口架构，车图页可能不在主窗口——识别/框选/导出必须全窗口覆盖。
 - (NSArray<UIWindow *> *)appWindows {
     NSMutableArray<UIWindow *> *out = [NSMutableArray new];
     for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
@@ -340,6 +404,7 @@ static void MGSetHidden(id self, SEL _cmd, BOOL hidden) {
         for (UIWindow *w in ((UIWindowScene *)sc).windows) {
             if (w == self.ballWindow || w == self.selectionWindow) continue;
             if (w.hidden || !w.rootViewController) continue;
+            if ([self isSystemInputWindow:w]) continue;
             [out addObject:w];
         }
     }
@@ -495,7 +560,12 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
             [stack removeLastObject];
             if (v == self.overlayView || v == self.adjustView) continue;
             UIImage *im = [v isKindOfClass:[UIImageView class]] ? ((UIImageView *)v).image : nil;
-            BOOL hasVisual = (im != nil || v.layer.contents != NULL);
+            NSString *cn = NSStringFromClass([v class]);
+            // 3D 渲染视图（SceneKit / GLKit / Metal）没有 image 也没有 contents，单独认出来
+            BOOL is3D = ([cn containsString:@"GLK"] || [cn containsString:@"SCN"] ||
+                         [cn containsString:@"MTK"] || [cn containsString:@"Metal"] ||
+                         [cn containsString:@"GLView"]);
+            BOOL hasVisual = (im != nil || v.layer.contents != NULL || is3D);
             if (hasVisual && !v.hidden && v.alpha > 0.05) {
                 CGSize b = v.bounds.size;
                 CGRect inRoot = [v convertRect:v.bounds toView:root];
@@ -511,10 +581,10 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                 if (sizeOK && centerOK && !bgLike) {
                     CGFloat score = (b.width * b.height) / (W * H) * 10.0;
                     if (im) score += 2.0;
+                    if (is3D) score += 9.0;   // 3D 车模优先级最高，且直接可隐藏
                     for (UIView *p = v.superview; p && p != root; p = p.superview) {
                         if ([p isKindOfClass:[UIControl class]]) { score += 8.0; break; }
                     }
-                    NSString *cn = NSStringFromClass([v class]);
                     if ([cn containsString:@"Car"] || [cn containsString:@"Vehicle"] ||
                         [cn containsString:@"Status"]) score += 6.0;
                     if (score > autoBestScore) { autoBestScore = score; autoBest = v; autoWin = win; }
@@ -589,6 +659,82 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [[NSUserDefaults standardUserDefaults] setObject:s forKey:kKeyCarRect];
 }
 
+#pragma mark - 区域模式（车图是 3D 渲染，没有 UIImageView 可替换，只能按区域覆盖）
+
+- (NSString *)currentVCKey {
+    return NSStringFromClass([[self topVC] class]);
+}
+
+- (CGRect)regionNormForVC:(NSString *)vcKey {
+    NSDictionary *m = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kKeyRegionMap];
+    NSString *s = [m isKindOfClass:[NSDictionary class]] ? m[vcKey] : nil;
+    if (![s isKindOfClass:[NSString class]] || !s.length) return CGRectNull;
+    return MGParseRect(s);
+}
+
+- (void)saveRegion:(CGRect)r forVC:(NSString *)vcKey {
+    if (!vcKey.length) return;
+    NSMutableDictionary *m = [[[NSUserDefaults standardUserDefaults]
+                               dictionaryForKey:kKeyRegionMap] mutableCopy] ?: [NSMutableDictionary new];
+    m[vcKey] = [NSString stringWithFormat:@"%.4f,%.4f,%.4f,%.4f",
+                r.origin.x, r.origin.y, r.size.width, r.size.height];
+    [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyRegionMap];
+}
+
+// 按当前页面的区域配置挂载覆盖图；没有配置则返回 NO
+- (BOOL)mountRegionOverlayIfNeeded {
+    UIWindow *win = [self appMainWindow];
+    UIView *root = win.rootViewController.view;
+    if (!win || !root) return NO;
+    CGRect n = [self regionNormForVC:[self currentVCKey]];
+    if (CGRectIsNull(n)) return NO;   // 本页没画框 → 交给视图模式
+
+    if (!self.carImage) {
+        // 区域已定但还没选图：清掉旧 overlay，且不再回落到视图模式
+        if (self.overlayView) [self unmountOverlay];
+        return YES;
+    }
+    // 从旧模式切过来：先把被隐藏的原图还原
+    if (self.carView) {
+        UIView *old = self.carView;
+        self.carView = nil;
+        if (gGuardView == old) gGuardView = nil;
+        if (self.origSaved) {
+            old.hidden = self.origHidden;
+            old.alpha = self.origAlpha;
+            self.origSaved = NO;
+        }
+    }
+    if (!self.overlayView) {
+        UIImageView *iv = [UIImageView new];
+        iv.backgroundColor = [UIColor clearColor];
+        iv.userInteractionEnabled = NO;
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.clipsToBounds = NO;
+        iv.autoresizingMask = UIViewAutoresizingNone;
+        self.overlayView = iv;
+    }
+    CGSize R = root.bounds.size;
+    self.overlayView.image = self.carImage;
+    self.overlayView.frame = CGRectMake(n.origin.x * R.width, n.origin.y * R.height,
+                                        n.size.width * R.width, n.size.height * R.height);
+    if (self.overlayView.superview != root) {
+        [self.overlayView removeFromSuperview];
+        [root addSubview:self.overlayView];
+    } else {
+        [root bringSubviewToFront:self.overlayView];
+    }
+    if (self.adjustView) {
+        self.adjustView.frame = self.overlayView.frame;
+        if (self.adjustView.superview != root) {
+            [self.adjustView removeFromSuperview];
+            [root addSubview:self.adjustView];
+        }
+        [root bringSubviewToFront:self.adjustView];
+    }
+    return YES;
+}
+
 - (CGRect)overlayFrameForCar:(UIView *)car {
     if (!car || !car.superview) return CGRectNull;
     CGRect base = [car convertRect:car.bounds toView:car.superview];
@@ -631,63 +777,19 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         self.carImage = [[UIImage alloc] initWithContentsOfFile:path];
         MGLog(@"[图片] 重新加载 %@ stamp=%@", self.carImage ? @"OK" : @"失败", stamp);
     }
-    UIView *car = [self findCarView];
-    if (!car) {
-        // 修复 0.1.2 误报：目标失效（换页/识别失败）时清掉残留 overlay，
-        // 否则旧 overlay 一直挂着，选图后会误弹「替换成功」
-        if (self.overlayView && (!self.carView || !self.carView.window)) {
-            MGLog(@"[覆盖] 目标失效，清理残留 overlay");
-            UIView *staleCar = self.carView;
-            [self unmountOverlay];
-            if (gGuardView == staleCar) gGuardView = nil;
-            if (self.origSaved && staleCar) {
-                staleCar.hidden = self.origHidden;
-                staleCar.alpha = self.origAlpha;
-                self.origSaved = NO;
-            }
+    // 只走区域模式：车图是 3D 渲染（无 UIImageView 可换），本页没有区域就什么都不做
+    if ([self mountRegionOverlayIfNeeded]) return;
+    if (self.overlayView) [self unmountOverlay];
+    if (self.carView) {   // 从旧模式残留的隐藏状态还原
+        UIView *old = self.carView;
+        self.carView = nil;
+        if (gGuardView == old) gGuardView = nil;
+        if (self.origSaved) {
+            old.hidden = self.origHidden;
+            old.alpha = self.origAlpha;
+            self.origSaved = NO;
         }
-        return;
     }
-    if (!self.carImage) {
-        if (self.overlayView || (self.origSaved && car.hidden)) [self restoreCar:car];
-        return;
-    }
-    if (self.carView != car) {
-        [self unmountOverlay];
-        self.carView = car;
-        self.origSaved = NO;
-    }
-    if (!self.origSaved) {
-        self.origSaved = YES;
-        self.origHidden = car.hidden;
-        self.origAlpha = car.alpha;
-        MGLog(@"[原车] 认准 %@ frame=%@ hidden=%d", NSStringFromClass([car class]),
-              NSStringFromCGRect(car.frame), (int)car.hidden);
-    }
-    if (!self.overlayView) {
-        UIImageView *iv = [UIImageView new];
-        iv.backgroundColor = [UIColor clearColor];
-        iv.userInteractionEnabled = NO;
-        iv.contentMode = UIViewContentModeScaleAspectFit;
-        iv.clipsToBounds = NO;
-        self.overlayView = iv;
-    }
-    self.overlayView.image = self.carImage;
-    CGRect fr = [self overlayFrameForCar:car];
-    if (!CGRectIsNull(fr)) self.overlayView.frame = fr;
-    self.overlayView.autoresizingMask = UIViewAutoresizingNone;
-    if (self.overlayView.superview != car.superview) {
-        [self.overlayView removeFromSuperview];
-        [car.superview addSubview:self.overlayView];
-    } else {
-        [car.superview bringSubviewToFront:self.overlayView];
-    }
-    if (self.adjustView && self.adjustView.superview == car.superview) {
-        self.adjustView.frame = self.overlayView.frame;
-        [car.superview bringSubviewToFront:self.adjustView];
-    }
-    gGuardView = car;                 // setHidden 拦截器接管
-    if (!car.hidden) car.hidden = YES;
 }
 
 #pragma mark - 悬浮球
@@ -763,13 +865,13 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                                                                 message:nil
                                                          preferredStyle:UIAlertControllerStyleActionSheet];
     __weak MGManager *ws = self;
-    [ac addAction:[UIAlertAction actionWithTitle:@"① 手动框选原车图（本页指定目标，推荐）" style:UIAlertActionStyleDefault
+    [ac addAction:[UIAlertAction actionWithTitle:@"① 框选车图区域（拖框，推荐先做）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginManualPick]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"② 替换车辆图片（相册选图）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws pickCarImage]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"微调位置 / 大小" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws beginAdjust]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"测试命中位置（橙色高亮）" style:UIAlertActionStyleDefault
+    [ac addAction:[UIAlertAction actionWithTitle:@"测试生效区域（橙色高亮）" style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [ws testHit]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"恢复原车图" style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *a) { [ws restoreOriginal]; }]];
@@ -842,16 +944,19 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                     self.carView = nil;   // 重新识别
                     [self applyOverlays];
                     MGLog(@"[选图] 已写入 %@ (%lu bytes)", path, (unsigned long)png.length);
-                    if (self.carView && self.carView.window &&
-                        self.overlayView && self.overlayView.superview) {
-                        UIView *car = self.carView;
-                        [self alertDone:[NSString stringWithFormat:
-                            @"已替换 → 命中 %@\nframe=%@\n若画面无变化，请把 Documents/MGLiveSkin/log.txt 发回",
-                            NSStringFromClass([car class]),
-                            NSStringFromCGRect(car.frame)]];
+                    if (self.overlayView && self.overlayView.superview) {
+                        NSString *vcKey = [self currentVCKey];
+                        if (!CGRectIsNull([self regionNormForVC:vcKey])) {
+                            [self alertDone:@"已替换（区域模式）\n位置不对可用「微调位置 / 大小」"];
+                        } else {
+                            UIView *car = self.carView;
+                            [self alertDone:[NSString stringWithFormat:
+                                @"已替换（视图模式）→ %@\nframe=%@",
+                                NSStringFromClass([car class]), NSStringFromCGRect(car.frame)]];
+                        }
                     } else {
-                        [self alertDone:@"图片已保存，但当前页面没识别到车图。\n"
-                         "推荐用「手动框选原车图」点一下原图（每个页面分别框选一次）。"];
+                        [self alertDone:@"图片已保存，但当前页面还没有生效区域。\n"
+                         "请先「① 框选车图区域」拖一个框，再选图。"];
                     }
                 });
             });
@@ -859,7 +964,7 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     }];
 }
 
-#pragma mark - 手动框选
+#pragma mark - 区域框选（车图是 3D 渲染，按区域覆盖）
 
 - (void)beginManualPick {
     UIWindow *win = [self appMainWindow];
@@ -871,12 +976,12 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     vc.view.backgroundColor = [UIColor clearColor];
     MGSelectionView *sv = [[MGSelectionView alloc] initWithFrame:vc.view.bounds];
     UILabel *hint = [UILabel new];
-    hint.text = @"点击原车图片（不是整块卡片）";
+    hint.text = @"按住拖出一个框，正好框住原车图";
     hint.font = [UIFont boldSystemFontOfSize:15.0];
     hint.textColor = [UIColor whiteColor];
     hint.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
     hint.textAlignment = NSTextAlignmentCenter;
-    hint.frame = CGRectMake(40.0, 100.0, win.bounds.size.width - 80.0, 40.0);
+    hint.frame = CGRectMake(20.0, 100.0, win.bounds.size.width - 40.0, 40.0);
     hint.layer.cornerRadius = 8.0;
     hint.clipsToBounds = YES;
     [vc.view addSubview:sv];
@@ -885,28 +990,28 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     selWin.hidden = NO;
     self.selectionWindow = selWin;
     __weak MGManager *ws = self;
-    sv.pick = ^(CGPoint p) {
-        UIView *found = [ws findImageViewNearPoint:p inWindow:win];
+    sv.pickRect = ^(CGRect r) {
         [ws closeSelection];
-        if (!found) { [ws alertDone:@"没找到图片视图，请点在车图上再试"]; return; }
-        [ws unmountOverlay];
-        ws.carView = found;
-        ws.origSaved = NO;
-        // 按「当前页面 VC 类名」记忆 class+父视图+尺寸，各页面互不影响
-        NSString *vcKey = NSStringFromClass([[ws topVC] class]);
-        NSMutableDictionary *m = [[[NSUserDefaults standardUserDefaults]
-                                   dictionaryForKey:kKeyManualMap] mutableCopy] ?: [NSMutableDictionary new];
-        m[vcKey] = @{@"cls": NSStringFromClass([found class]),
-                     @"sup": NSStringFromClass([found.superview class] ?: [NSObject class]),
-                     @"w": @(found.bounds.size.width),
-                     @"h": @(found.bounds.size.height)};
-        [[NSUserDefaults standardUserDefaults] setObject:m forKey:kKeyManualMap];
+        CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
+        if (W < 1 || H < 1 || r.size.width < 30 || r.size.height < 30) {
+            [ws alertDone:@"框太小了，请重新拖一个框"];
+            return;
+        }
+        CGRect n = CGRectMake(r.origin.x / W, r.origin.y / H,
+                              r.size.width / W, r.size.height / H);
+        NSString *vcKey = [ws currentVCKey];
+        [ws saveRegion:n forVC:vcKey];
         [ws applyOverlays];
-        MGLog(@"[框选] 页面 %@ 手动选中 %@ frame=%@", vcKey,
-              NSStringFromClass([found class]), NSStringFromCGRect(found.frame));
-        [ws alertDone:[NSString stringWithFormat:
-            @"已选中 %@（页面 %@）\n先选图再框选也行：菜单「替换车辆图片（相册选图）」",
-            NSStringFromClass([found class]), vcKey]];
+        MGLog(@"[框选] 页面 %@ 区域 %@", vcKey, NSStringFromCGRect(r));
+        if (ws.overlayView && ws.overlayView.superview) {
+            [ws alertDone:[NSString stringWithFormat:
+                @"已记录区域（页面 %@）\n%@\n现在选「② 替换车辆图片（相册选图）」",
+                vcKey, NSStringFromCGRect(n)]];
+        } else {
+            [ws alertDone:[NSString stringWithFormat:
+                @"已记录区域（页面 %@）\n%@\n还没选图，请选「② 替换车辆图片（相册选图）」",
+                vcKey, NSStringFromCGRect(n)]];
+        }
     };
 }
 
@@ -918,30 +1023,50 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     w.windowScene = nil;
 }
 
-// 调试：橙色高亮显示当前识别命中的位置，5 秒后自动消失
+// 调试：橙色高亮显示当前生效的位置（区域模式或视图模式），5 秒后消失
 - (void)testHit {
-    self.carView = nil;   // 强制重新识别，反映当前页面状态
-    UIView *car = [self findCarView];
-    if (!car || !car.superview) {
-        [self alertDone:@"当前页面未识别到车图\n（可先用手动框选指定，再回来验证）"];
-        return;
+    UIWindow *win = [self appMainWindow];
+    UIView *root = win.rootViewController.view;
+    if (!win || !root) { [self alertDone:@"没有可用窗口"]; return; }
+
+    CGRect n = [self regionNormForVC:[self currentVCKey]];
+    UIView *host = root;
+    CGRect boxFrame = CGRectNull;
+    NSString *desc = nil;
+
+    if (!CGRectIsNull(n)) {
+        CGSize R = root.bounds.size;
+        boxFrame = CGRectMake(n.origin.x * R.width, n.origin.y * R.height,
+                              n.size.width * R.width, n.size.height * R.height);
+        desc = [NSString stringWithFormat:@"区域模式 %@\n（页面 %@）",
+                NSStringFromCGRect(n), [self currentVCKey]];
+    } else {
+        self.carView = nil;
+        UIView *car = [self findCarView];
+        if (!car || !car.superview) {
+            [self alertDone:@"当前页面还没有记录区域\n请用「① 框选车图区域」拖一个框"];
+            return;
+        }
+        host = car.superview;
+        boxFrame = [car convertRect:car.bounds toView:host];
+        desc = [NSString stringWithFormat:@"视图模式 %@\nframe=%@",
+                NSStringFromClass([car class]), NSStringFromCGRect(car.frame)];
     }
-    UIView *box = [[UIView alloc] initWithFrame:[car convertRect:car.bounds toView:car.superview]];
+
+    UIView *box = [[UIView alloc] initWithFrame:boxFrame];
     box.backgroundColor = [[UIColor colorWithRed:1.0 green:0.42 blue:0.0 alpha:0.45] colorWithAlphaComponent:0.45];
     box.layer.borderColor = [UIColor whiteColor].CGColor;
     box.layer.borderWidth = 2.0;
     box.userInteractionEnabled = NO;
     box.tag = 9527;
-    [car.superview addSubview:box];
-    [car.superview bringSubviewToFront:box];
-    MGLog(@"[测试] 高亮 %@ frame=%@ superview=%@", NSStringFromClass([car class]),
-          NSStringFromCGRect(car.frame), NSStringFromClass([car.superview class]));
+    [host addSubview:box];
+    [host bringSubviewToFront:box];
+    MGLog(@"[测试] 高亮 %@", desc);
     __weak UIView *wbox = box;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [wbox removeFromSuperview]; });
     [self alertDone:[NSString stringWithFormat:
-        @"橙色区域 = 当前命中 %@\nframe=%@\n不在车图上？请用手动框选重新指定",
-        NSStringFromClass([car class]), NSStringFromCGRect(car.frame)]];
+        @"橙色区域 = 当前生效位置\n%@\n不对就用「① 框选车图区域」重新拖框", desc]];
 }
 
 #pragma mark - 微调
@@ -967,6 +1092,23 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 }
 
 - (void)adjustPanned:(UIPanGestureRecognizer *)g {
+    // 区域模式：直接改区域归一化坐标
+    UIWindow *win = [self appMainWindow];
+    UIView *root = win.rootViewController.view;
+    CGSize R = root ? root.bounds.size : CGSizeZero;
+    NSString *vcKey = [self currentVCKey];
+    CGRect reg = [self regionNormForVC:vcKey];
+    if (!CGRectIsNull(reg) && R.width > 1 && R.height > 1) {
+        CGPoint t = [g translationInView:root];
+        reg.origin.x += t.x / R.width;
+        reg.origin.y += t.y / R.height;
+        reg.origin.x = MAX(-0.5, MIN(1.5, reg.origin.x));
+        reg.origin.y = MAX(-0.5, MIN(1.5, reg.origin.y));
+        [self saveRegion:reg forVC:vcKey];
+        [g setTranslation:CGPointZero inView:root];
+        [self applyOverlays];
+        return;
+    }
     UIView *car = self.carView;
     if (!car || !car.superview) return;
     CGRect base = [car convertRect:car.bounds toView:car.superview];
@@ -983,8 +1125,18 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 }
 
 - (void)adjustPinched:(UIPinchGestureRecognizer *)g {
-    CGRect n = [self normRect];
     CGFloat s = g.scale;
+    NSString *vcKey = [self currentVCKey];
+    CGRect reg = [self regionNormForVC:vcKey];
+    if (!CGRectIsNull(reg)) {
+        reg.size.width = MAX(0.08, MIN(1.6, reg.size.width * s));
+        reg.size.height = MAX(0.08, MIN(1.6, reg.size.height * s));
+        [self saveRegion:reg forVC:vcKey];
+        g.scale = 1.0;
+        [self applyOverlays];
+        return;
+    }
+    CGRect n = [self normRect];
     n.size.width = MAX(0.08, MIN(2.0, n.size.width * s));
     n.size.height = MAX(0.08, MIN(2.0, n.size.height * s));
     [self saveNormRect:n];
@@ -1006,21 +1158,18 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud removeObjectForKey:kKeyCarRect];
     [ud removeObjectForKey:kKeyManualClass];
-    // 清除当前页面的手动配置（全部清除，彻底还原）
-    NSMutableDictionary *m = [[ud dictionaryForKey:kKeyManualMap] mutableCopy];
-    if (m.count) {
-        [m removeAllObjects];
-        [ud setObject:m forKey:kKeyManualMap];
-    }
+    [ud removeObjectForKey:kKeyRegionMap];
+    [ud removeObjectForKey:kKeyManualMap];
     NSString *path = [MGDir() stringByAppendingPathComponent:@"car.png"];
     [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
     self.carImage = nil;
     self.imageStamp = nil;
     UIView *car = self.carView;
     if (car) [self restoreCar:car];
+    [self unmountOverlay];
     self.carView = nil;
     gGuardView = nil;
-    MGLog(@"[恢复] 已恢复原车图");
+    MGLog(@"[恢复] 已恢复原车图（含区域配置）");
     [self unhideBall];
     [self alertDone:@"已恢复原车图"];
 }
