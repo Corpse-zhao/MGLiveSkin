@@ -371,13 +371,20 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 
 - (BOOL)onVehicleStatusPage:(UIView *)root vc:(UIViewController *)vc {
     NSString *title = vc.title ?: vc.navigationItem.title;
-    for (NSString *k in @[@"车辆状态", @"VehicleStatus", @"CarStatus"]) {
-        if ([title containsString:k]) return YES;
+    for (NSString *k in @[@"车辆状态", @"VehicleStatus", @"CarStatus", @"爱车", @"续航", @"里程"]) {
+        if (title.length && [title containsString:k]) return YES;
     }
-    return MGViewHasText(root, @[@"车辆状态", @"当前续航", @"总里程", @"胎压"], 0);
+    // VC 类名带 Car/Vehicle/Drive/Status 也算（MG Live 大量 MG* 自定义类）
+    NSString *vcn = NSStringFromClass([vc class]);
+    for (NSString *k in @[@"Car", @"Vehicle", @"Drive", @"Status"]) {
+        if ([vcn containsString:k]) return YES;
+    }
+    return MGViewHasText(root, @[@"车辆状态", @"当前续航", @"总里程", @"胎压",
+                                 @"续航", @"里程", @"空调", @"车辆健康"], 0);
 }
 
-// 自动识别车图：只在「车辆状态」页动手，按尺寸/比例/位置/透明度打分
+// 自动识别车图：按尺寸/比例/位置/页面特征打分。
+// 手动框选过的 class 拥有最高优先级，且跳过页面判断。
 - (UIView *)findCarView {
     UIView *cached = self.carView;
     if (cached && cached.superview && cached.window) return cached;
@@ -385,11 +392,43 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     UIWindow *win = [self appMainWindow];
     UIView *root = win.rootViewController.view;
     if (!win || !root) return nil;
-    UIViewController *vc = [self topVC];
-    if (![self onVehicleStatusPage:root vc:vc]) return nil;
-
     CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
     if (W < 100 || H < 100) return nil;
+
+    NSString *manual = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyManualClass];
+
+    // 手动指定过 class：整个窗口树里找该 class 的最大可见图像视图，不卡页面
+    if (manual.length) {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+        UIView *best = nil;
+        CGFloat bestArea = 0;
+        while (stack.count) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if (v == self.overlayView || v == self.adjustView) continue;
+            if (!v.hidden && v.alpha > 0.05 &&
+                [NSStringFromClass([v class]) isEqualToString:manual]) {
+                CGSize b = v.bounds.size;
+                if (b.width >= 50 && b.height >= 50) {
+                    CGFloat area = b.width * b.height;
+                    if (area > bestArea) { bestArea = area; best = v; }
+                }
+            }
+            if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
+        }
+        if (best) {
+            self.carView = best;
+            MGLog(@"[识别] 手动 class 命中 %@ frame=%@", NSStringFromClass([best class]),
+                  NSStringFromCGRect(best.frame));
+            return best;
+        }
+        MGLog(@"[识别] 手动 class %@ 在当前页面未找到，回退自动识别", manual);
+    }
+
+    UIViewController *vc = [self topVC];
+    BOOL pageOK = [self onVehicleStatusPage:root vc:vc];
+    if (!pageOK) return nil;   // 未手动框选且页面不匹配时仍不动手，避免乱替换
+
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     UIView *best = nil;
     CGFloat bestScore = 0;
@@ -402,13 +441,16 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         if (hasVisual && !v.hidden && v.alpha > 0.05) {
             CGSize b = v.bounds.size;
             CGRect inRoot = [v convertRect:v.bounds toView:root];
-            CGFloat ratio = b.height / MAX(b.width, 1.0);
-            BOOL sizeOK = (b.width >= 80 && b.width <= W * 0.75 &&
-                           b.height >= 200 && b.height <= H * 0.75 &&
-                           ratio >= 1.6 && ratio <= 6.0);
+            CGFloat ratio = b.height / MAX(b.width, 1.0);   // 高/宽
+            // 放宽：横图 / 方图 / 竖图都认（俯视车图不一定是竖长图）
+            BOOL sizeOK = (b.width >= 90 && b.width <= W * 0.85 &&
+                           b.height >= 140 && b.height <= H * 0.75 &&
+                           ratio >= 0.35 && ratio <= 6.0);
+            // 排除明显的全屏背景图
+            BOOL bgLike = (b.width >= W * 0.98 && b.height >= H * 0.9);
             CGFloat midX = CGRectGetMidX(inRoot);
-            BOOL centerOK = (midX > W * 0.18 && midX < W * 0.82);
-            if (sizeOK && centerOK) {
+            BOOL centerOK = (midX > W * 0.10 && midX < W * 0.90);
+            if (sizeOK && centerOK && !bgLike) {
                 CGFloat score = (b.width * b.height) / (W * H) * 10.0;
                 if (im) score += 2.0;
                 for (UIView *p = v.superview; p && p != root; p = p.superview) {
@@ -417,15 +459,13 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                 NSString *cn = NSStringFromClass([v class]);
                 if ([cn containsString:@"Car"] || [cn containsString:@"Vehicle"] ||
                     [cn containsString:@"Status"]) score += 6.0;
-                NSString *manual = [[NSUserDefaults standardUserDefaults] stringForKey:kKeyManualClass];
-                if (manual.length && [cn isEqualToString:manual]) score += 30.0;
                 if (score > bestScore) { bestScore = score; best = v; }
             }
         }
         if (stack.count < 4000) [stack addObjectsFromArray:v.subviews];
     }
     if (bestScore < 3.0) {
-        MGLog(@"[识别] 未找到车图（最高分 %.2f）", bestScore);
+        MGLog(@"[识别] 未找到车图（pageOK=%d 最高分 %.2f）", (int)pageOK, bestScore);
         return nil;
     }
     self.carView = best;
@@ -434,10 +474,13 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     return best;
 }
 
-// 手动框选时，按落点找图片视图
+// 手动框选时，按落点找图片视图：
+// 在包含落点的候选里选面积最大的非背景图（避免选中全屏背景）
 - (UIView *)findImageViewNearPoint:(CGPoint)p inWindow:(UIWindow *)win {
     UIView *root = win.rootViewController.view;
     if (!root) return nil;
+    CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
+    CGFloat maxArea = W * H * 0.6;   // 超过屏幕 60% 的当背景排除
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     UIView *best = nil;
     CGFloat bestArea = 0;
@@ -448,9 +491,10 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
         UIImage *im = [v isKindOfClass:[UIImageView class]] ? ((UIImageView *)v).image : nil;
         if (im || v.layer.contents) {
             CGRect r = [v convertRect:v.bounds toView:win];
-            if (CGRectContainsPoint(r, p)) {
+            if (CGRectContainsPoint(r, p) && !v.hidden && v.alpha > 0.05) {
                 CGFloat area = r.size.width * r.size.height;
-                if (area > bestArea && r.size.width >= 60 && r.size.height >= 120) {
+                if (area > bestArea && area <= maxArea &&
+                    r.size.width >= 50 && r.size.height >= 50) {
                     bestArea = area;
                     best = v;
                 }
@@ -714,9 +758,15 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (!ok) { [self alertDone:@"图片处理失败，请换一张试试"]; return; }
                     self.imageStamp = nil;
+                    self.carView = nil;   // 重新识别
                     [self applyOverlays];
                     MGLog(@"[选图] 已写入 %@ (%lu bytes)", path, (unsigned long)png.length);
-                    [self alertDone:@"车辆图片已替换\n如位置不对，选「微调位置 / 大小」"];
+                    if (self.overlayView && self.overlayView.superview) {
+                        [self alertDone:@"车辆图片已替换\n如位置不对，选「微调位置 / 大小」"];
+                    } else {
+                        [self alertDone:@"图片已保存，但当前页面没识别到车图。\n"
+                         "请先进入车辆状态页，再用「手动框选原车图」点一下原图。"];
+                    }
                 });
             });
         }];
@@ -850,6 +900,9 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
 - (void)dumpViewTree {
     NSMutableString *out = [NSMutableString stringWithCapacity:8192];
     [out appendFormat:@"==== MGLiveSkin %@ viewtree %@ ====\n", MG_VERSION, [NSDate date]];
+    UIViewController *vc = [self topVC];
+    [out appendFormat:@"[topVC] %@ title=%@ navTitle=%@\n", NSStringFromClass([vc class]),
+     vc.title ?: @"-", vc.navigationItem.title ?: @"-"];
     UIWindow *win = [self appMainWindow];
     if (win) {
         [out appendFormat:@"[window] %@ bounds=%@\n", NSStringFromClass([win class]),
@@ -862,7 +915,8 @@ static BOOL MGViewHasText(UIView *v, NSArray<NSString *> *keys, NSInteger depth)
     [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     MGLog(@"[诊断] 导出 %lu 字节", (unsigned long)out.length);
     [self unhideBall];
-    [self alertDone:[NSString stringWithFormat:@"已导出视图树：\n%@", path]];
+    [self alertDone:[NSString stringWithFormat:@"已导出视图树（当前页面 %@）：\n%@",
+                     NSStringFromClass([vc class]), path]];
 }
 
 - (void)dump:(UIView *)view to:(NSMutableString *)out depth:(NSInteger)depth {
